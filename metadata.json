@@ -1,0 +1,6 @@
+{
+  "name": "NEUROX ESPORTS",
+  "description": "منصة الرياضات الإلكترونية والمسابقات الثقافية التنافسية بنظام أوفلاين وسحابي متكامل",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

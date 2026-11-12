@@ -1,0 +1,111 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    --bg-primary: #070A12;
+    --bg-card: #111827;
+    --bg-panel: #1B253B;
+    --border-color: #28354E;
+    --neon-cyan: #4FF5D2;
+    --neon-gold: #FFD166;
+    --neon-purple: #A78BFA;
+    --neon-emerald: #10B981;
+    --neon-rose: #FF6B81;
+  }
+
+  body {
+    background-color: #070A12;
+    color: #F8FAFC;
+    font-family: 'Cairo', 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+    overflow-x: hidden;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  .font-mono-num {
+    font-family: 'JetBrains Mono', monospace;
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* Hide scrollbars globally for a sleek Native Mobile App feel */
+* {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+*::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
+@keyframes goldenCardPulse {
+  0%, 100% {
+    transform: scale(1);
+    box-shadow: 0 0 25px rgba(255, 209, 102, 0.16), inset 0 0 15px rgba(255, 209, 102, 0.05);
+    border-color: rgba(255, 209, 102, 0.75);
+  }
+  50% {
+    transform: scale(1.012);
+    box-shadow: 0 0 48px rgba(255, 209, 102, 0.42), inset 0 0 28px rgba(255, 209, 102, 0.14);
+    border-color: #FFD166;
+  }
+}
+
+@keyframes goldenAuraFade {
+  0%, 100% {
+    opacity: 0.15;
+  }
+  50% {
+    opacity: 0.6;
+  }
+}
+
+@keyframes goldenIconPulse {
+  0%, 100% {
+    transform: scale(1);
+    box-shadow: 0 0 12px rgba(255, 209, 102, 0.18);
+  }
+  50% {
+    transform: scale(1.07);
+    box-shadow: 0 0 28px rgba(255, 209, 102, 0.5);
+  }
+}
+
+@keyframes goldenCtaPulse {
+  0%, 100% {
+    transform: scale(1);
+    box-shadow: 0 4px 16px rgba(255, 209, 102, 0.25);
+  }
+  50% {
+    transform: scale(1.04);
+    box-shadow: 0 0 28px rgba(255, 209, 102, 0.65);
+  }
+}
+
+.animate-golden-card {
+  animation: goldenCardPulse 3s ease-in-out infinite;
+}
+
+.animate-golden-aura {
+  animation: goldenAuraFade 3s ease-in-out infinite;
+}
+
+.animate-golden-icon {
+  animation: goldenIconPulse 3s ease-in-out infinite;
+}
+
+.animate-golden-cta {
+  animation: goldenCtaPulse 3s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-golden-card,
+  .animate-golden-aura,
+  .animate-golden-icon,
+  .animate-golden-cta {
+    animation: none;
+  }
+}

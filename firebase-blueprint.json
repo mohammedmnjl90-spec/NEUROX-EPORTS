@@ -1,0 +1,278 @@
+{
+  "entities": {
+    "PublicPlayerProfile": {
+      "title": "PublicPlayerProfile",
+      "description": "Public leaderboard and matchmaking profile for a human player in NEUROX ESPORTS",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "playerId": {
+          "type": "string",
+          "maxLength": 16,
+          "pattern": "^#[0-9]{10}$"
+        },
+        "username": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 32
+        },
+        "countryCode": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 8
+        },
+        "countryFlag": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16
+        },
+        "xp": {
+          "type": "number"
+        },
+        "level": {
+          "type": "number"
+        },
+        "coins": {
+          "type": "number"
+        },
+        "monthlyPoints": {
+          "type": "number"
+        },
+        "rating": {
+          "type": "number"
+        },
+        "vipTier": {
+          "type": "string",
+          "enum": ["basic", "bronze", "silver", "royal_gold"]
+        },
+        "fairPlayScore": {
+          "type": "number"
+        },
+        "onlineWins": {
+          "type": "number"
+        },
+        "totalMatches": {
+          "type": "number"
+        },
+        "isBanned": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "uid",
+        "playerId",
+        "username",
+        "countryCode",
+        "countryFlag",
+        "xp",
+        "level",
+        "coins",
+        "monthlyPoints",
+        "rating",
+        "vipTier",
+        "fairPlayScore",
+        "onlineWins",
+        "totalMatches",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "PrivateUserVault": {
+      "title": "PrivateUserVault",
+      "description": "Isolated private user contact details and full serialized offline-first state backup",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "contactValue": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "contactType": {
+          "type": "string",
+          "enum": ["phone", "email"]
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "contactValue", "contactType", "updatedAt"]
+    },
+    "PrivateRoom": {
+      "title": "PrivateRoom",
+      "description": "4-digit private challenge room with deterministic question seed",
+      "type": "object",
+      "properties": {
+        "roomCode": {
+          "type": "string",
+          "maxLength": 16,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "hostUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "hostName": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "hostFlag": {
+          "type": "string",
+          "maxLength": 16
+        },
+        "guestUid": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "guestName": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "guestFlag": {
+          "type": "string",
+          "maxLength": 16
+        },
+        "category": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "questionSeed": {
+          "type": "number"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["waiting", "active", "completed"]
+        },
+        "hostScore": {
+          "type": "number"
+        },
+        "guestScore": {
+          "type": "number"
+        },
+        "hostReadyNextRound": {
+          "type": "boolean"
+        },
+        "guestReadyNextRound": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "roomCode",
+        "hostUid",
+        "hostName",
+        "hostFlag",
+        "guestUid",
+        "guestName",
+        "guestFlag",
+        "category",
+        "questionSeed",
+        "status",
+        "hostScore",
+        "guestScore",
+        "hostReadyNextRound",
+        "guestReadyNextRound",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "DirectMessage": {
+      "title": "DirectMessage",
+      "description": "Direct chat message or match challenge between two friends",
+      "type": "object",
+      "properties": {
+        "senderUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "receiverUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "senderName": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "roomCode": {
+          "type": "string",
+          "maxLength": 16
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "senderUid",
+        "receiverUid",
+        "senderName",
+        "text",
+        "roomCode",
+        "createdAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/players/{userId}": {
+      "schema": {
+        "$ref": "#/entities/PublicPlayerProfile"
+      },
+      "description": "Public leaderboard and player discovery profiles (no PII)"
+    },
+    "/users/{userId}": {
+      "schema": {
+        "$ref": "#/entities/PublicPlayerProfile"
+      },
+      "description": "Synchronized users collection for owner control panel and real-time player management"
+    },
+    "/user_vaults/{userId}": {
+      "schema": {
+        "$ref": "#/entities/PrivateUserVault"
+      },
+      "description": "Strictly owner-isolated PII vault for phone/email contact"
+    },
+    "/rooms/{roomId}": {
+      "schema": {
+        "$ref": "#/entities/PrivateRoom"
+      },
+      "description": "4-digit private challenge rooms and live match state"
+    },
+    "/messages/{messageId}": {
+      "schema": {
+        "$ref": "#/entities/DirectMessage"
+      },
+      "description": "Direct friend chat and challenge messages"
+    }
+  }
+}

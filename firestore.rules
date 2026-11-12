@@ -1,0 +1,251 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // 2. Hardened Primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // 3. Entity Validation Helpers
+    function isValidPublicPlayerProfile(data) {
+      return data.keys().hasAll([
+        'uid', 'playerId', 'username', 'countryCode', 'countryFlag',
+        'xp', 'level', 'coins', 'monthlyPoints', 'rating',
+        'vipTier', 'fairPlayScore', 'onlineWins', 'totalMatches',
+        'createdAt', 'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'uid', 'playerId', 'username', 'countryCode', 'countryFlag',
+        'xp', 'level', 'coins', 'monthlyPoints', 'rating',
+        'vipTier', 'fairPlayScore', 'onlineWins', 'totalMatches',
+        'isBanned', 'createdAt', 'updatedAt'
+      ]) &&
+      data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128 && data.uid.matches('^[a-zA-Z0-9_\\-]+$') &&
+      data.playerId is string && data.playerId.size() == 11 && data.playerId.matches('^#[0-9]{10}$') &&
+      data.username is string && data.username.size() >= 2 && data.username.size() <= 32 &&
+      data.countryCode is string && data.countryCode.size() >= 2 && data.countryCode.size() <= 8 &&
+      data.countryFlag is string && data.countryFlag.size() >= 1 && data.countryFlag.size() <= 16 &&
+      data.xp is int && data.xp >= 0 && data.xp <= 1000000000 &&
+      data.level is int && data.level >= 1 && data.level <= 6 &&
+      data.coins is int && data.coins >= 0 && data.coins <= 1000000000 &&
+      data.monthlyPoints is int && data.monthlyPoints >= 0 && data.monthlyPoints <= 1000000000 &&
+      data.rating is int && data.rating >= 0 && data.rating <= 1000000000 &&
+      data.vipTier is string && data.vipTier in ['basic', 'bronze', 'silver', 'royal_gold'] &&
+      data.fairPlayScore is int && data.fairPlayScore >= 0 && data.fairPlayScore <= 100 &&
+      data.onlineWins is int && data.onlineWins >= 0 && data.onlineWins <= 1000000000 &&
+      data.totalMatches is int && data.totalMatches >= 0 && data.totalMatches <= 1000000000 &&
+      (!('isBanned' in data) || data.isBanned is bool) &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    function isValidPrivateUserVault(data) {
+      return data.keys().hasAll(['uid', 'contactValue', 'contactType', 'updatedAt']) &&
+      data.keys().hasOnly(['uid', 'contactValue', 'contactType', 'updatedAt']) &&
+      data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128 && data.uid.matches('^[a-zA-Z0-9_\\-]+$') &&
+      data.contactValue is string && data.contactValue.size() >= 3 && data.contactValue.size() <= 120 &&
+      data.contactType is string && data.contactType in ['phone', 'email'] &&
+      data.updatedAt is timestamp;
+    }
+
+    function isValidPrivateRoom(data) {
+      return data.keys().hasAll([
+        'roomCode', 'hostUid', 'hostName', 'hostFlag',
+        'guestUid', 'guestName', 'guestFlag',
+        'category', 'questionSeed', 'status',
+        'hostScore', 'guestScore', 'hostReadyNextRound', 'guestReadyNextRound',
+        'createdAt', 'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'roomCode', 'hostUid', 'hostName', 'hostFlag',
+        'guestUid', 'guestName', 'guestFlag',
+        'category', 'questionSeed', 'status',
+        'hostScore', 'guestScore', 'hostReadyNextRound', 'guestReadyNextRound',
+        'createdAt', 'updatedAt'
+      ]) &&
+      data.roomCode is string && data.roomCode.size() >= 4 && data.roomCode.size() <= 16 && data.roomCode.matches('^[a-zA-Z0-9_\\-]+$') &&
+      data.hostUid is string && data.hostUid.size() >= 1 && data.hostUid.size() <= 128 && data.hostUid.matches('^[a-zA-Z0-9_\\-]+$') &&
+      data.hostName is string && data.hostName.size() >= 1 && data.hostName.size() <= 32 &&
+      data.hostFlag is string && data.hostFlag.size() >= 1 && data.hostFlag.size() <= 16 &&
+      data.guestUid is string && data.guestUid.size() <= 128 &&
+      data.guestName is string && data.guestName.size() <= 32 &&
+      data.guestFlag is string && data.guestFlag.size() <= 16 &&
+      data.category is string && data.category.size() >= 1 && data.category.size() <= 32 &&
+      data.questionSeed is int && data.questionSeed >= 0 &&
+      data.status is string && data.status in ['waiting', 'active', 'completed'] &&
+      data.hostScore is int && data.hostScore >= 0 && data.hostScore <= 100 &&
+      data.guestScore is int && data.guestScore >= 0 && data.guestScore <= 100 &&
+      data.hostReadyNextRound is bool &&
+      data.guestReadyNextRound is bool &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    function isValidDirectMessage(data) {
+      return data.keys().hasAll(['senderUid', 'receiverUid', 'senderName', 'text', 'roomCode', 'createdAt']) &&
+      data.keys().hasOnly(['senderUid', 'receiverUid', 'senderName', 'text', 'roomCode', 'createdAt']) &&
+      data.senderUid is string && data.senderUid.size() >= 1 && data.senderUid.size() <= 128 && data.senderUid.matches('^[a-zA-Z0-9_\\-]+$') &&
+      data.receiverUid is string && data.receiverUid.size() >= 1 && data.receiverUid.size() <= 128 && data.receiverUid.matches('^[a-zA-Z0-9_\\-]+$') &&
+      data.senderName is string && data.senderName.size() >= 1 && data.senderName.size() <= 32 &&
+      data.text is string && data.text.size() >= 1 && data.text.size() <= 300 &&
+      data.roomCode is string && data.roomCode.size() <= 16 &&
+      data.createdAt is timestamp;
+    }
+
+    // 4. Collection Rules
+    match /players/{userId} {
+      allow get: if isValidId(userId);
+      allow list: if resource.data.monthlyPoints >= 0;
+
+      allow create: if isValidId(userId) &&
+        isValidPublicPlayerProfile(incoming()) &&
+        incoming().uid == userId &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isValidId(userId) &&
+        isValidPublicPlayerProfile(incoming()) &&
+        incoming().uid == existing().uid &&
+        incoming().playerId == existing().playerId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'username', 'countryCode', 'countryFlag',
+          'xp', 'level', 'coins', 'monthlyPoints', 'rating',
+          'vipTier', 'fairPlayScore', 'onlineWins', 'totalMatches', 'isBanned', 'updatedAt'
+        ]);
+
+      allow delete: if false;
+    }
+
+    match /users/{userId} {
+      allow get: if isValidId(userId);
+      allow list: if resource.data.monthlyPoints >= 0;
+
+      allow create: if isValidId(userId) &&
+        isValidPublicPlayerProfile(incoming()) &&
+        incoming().uid == userId &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isValidId(userId) &&
+        isValidPublicPlayerProfile(incoming()) &&
+        incoming().uid == existing().uid &&
+        incoming().playerId == existing().playerId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'username', 'countryCode', 'countryFlag',
+          'xp', 'level', 'coins', 'monthlyPoints', 'rating',
+          'vipTier', 'fairPlayScore', 'onlineWins', 'totalMatches', 'isBanned', 'updatedAt'
+        ]);
+
+      allow delete: if false;
+    }
+
+    match /user_vaults/{userId} {
+      allow get: if isVerifiedUser() && isValidId(userId) && userId == request.auth.uid;
+      allow list: if false;
+
+      allow create: if isVerifiedUser() &&
+        isValidId(userId) &&
+        userId == request.auth.uid &&
+        isValidPrivateUserVault(incoming()) &&
+        incoming().uid == request.auth.uid &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser() &&
+        isValidId(userId) &&
+        userId == request.auth.uid &&
+        isValidPrivateUserVault(incoming()) &&
+        incoming().uid == existing().uid &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['contactValue', 'contactType', 'updatedAt']);
+
+      allow delete: if false;
+    }
+
+    match /rooms/{roomId} {
+      allow get: if isValidId(roomId);
+      allow list: if resource.data.status in ['waiting', 'active'];
+
+      allow create: if isValidId(roomId) &&
+        isValidPrivateRoom(incoming()) &&
+        incoming().roomCode == roomId &&
+        incoming().guestUid == '' &&
+        incoming().status == 'waiting' &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isValidId(roomId) &&
+        isValidPrivateRoom(incoming()) &&
+        existing().status != 'completed' &&
+        incoming().roomCode == existing().roomCode &&
+        incoming().hostUid == existing().hostUid &&
+        incoming().hostName == existing().hostName &&
+        incoming().hostFlag == existing().hostFlag &&
+        incoming().category == existing().category &&
+        incoming().questionSeed == existing().questionSeed &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          // Action 1: Guest Joins Waiting Room
+          (
+            existing().status == 'waiting' &&
+            existing().guestUid == '' &&
+            incoming().status == 'active' &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['guestUid', 'guestName', 'guestFlag', 'status', 'updatedAt'])
+          ) ||
+          // Action 2: Host or Guest Updates Score / Round Readiness / Completion
+          (
+            incoming().guestUid == existing().guestUid &&
+            incoming().guestName == existing().guestName &&
+            incoming().guestFlag == existing().guestFlag &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'hostScore', 'guestScore', 'hostReadyNextRound', 'guestReadyNextRound', 'status', 'updatedAt'
+            ])
+          )
+        );
+
+      allow delete: if false;
+    }
+
+    match /messages/{messageId} {
+      allow get: if isSignedIn() &&
+        isValidId(messageId) &&
+        (resource.data.senderUid == request.auth.uid || resource.data.receiverUid == request.auth.uid);
+
+      allow list: if isSignedIn() &&
+        (resource.data.senderUid == request.auth.uid || resource.data.receiverUid == request.auth.uid);
+
+      allow create: if isVerifiedUser() &&
+        isValidId(messageId) &&
+        isValidDirectMessage(incoming()) &&
+        incoming().senderUid == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        exists(/databases/$(database)/documents/players/$(request.auth.uid));
+
+      allow update, delete: if false;
+    }
+  }
+}
