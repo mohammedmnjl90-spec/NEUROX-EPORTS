@@ -67,29 +67,35 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
   const vt = getViewTranslations(account.language);
   const baseAccountAtStartRef = useRef<PlayerAccount>(account);
   const matchIdRef = useRef<string>(`mtc_${Date.now()}`);
-  // Determine if opponent is human or Smart Bot
+  // Determine if opponent is human or Smart Bot (NEVER a bot in mode === 'room' or local mode)
   const [opponentName, setOpponentName] = useState<string>(
     customOpponentName ||
       (mode === 'local'
         ? 'Player 2 👥'
         : mode === 'solo'
         ? 'Solo 🎯'
+        : mode === 'room'
+        ? 'بانتظار دخول الصديق...'
         : vt.searchingOpponentText)
   );
   const [opponentFlag, setOpponentFlag] = useState<string>(
-    customOpponentFlag || (mode === 'local' ? '🎮' : '🤖')
+    customOpponentFlag || (mode === 'local' ? '🎮' : mode === 'room' ? '⏳' : '🤖')
   );
   const [opponentIsBot, setOpponentIsBot] = useState<boolean>(
-    mode === 'solo' || (!customOpponentName && mode !== 'local')
+    mode === 'room' || mode === 'local'
+      ? false
+      : mode === 'solo' || !customOpponentName
   );
   const [opponentPlayerId, setOpponentPlayerId] = useState<string | null>(
-    customOpponentPlayerId || (customOpponentName ? '#7482910384' : null) // Bots NEVER have an ID
+    customOpponentPlayerId || (mode === 'room' ? 'غرفة تحدي سحابية' : customOpponentName ? '#7482910384' : null)
   );
 
   const [phase, setPhase] = useState<MatchPhase>(
     mode === 'online' || mode === 'room' ? 'MATCHMAKING' : 'PLAYING_ROUND'
   );
   const [matchmakingSec, setMatchmakingSec] = useState(3);
+  const [roomCloudStatus, setRoomCloudStatus] = useState<'waiting' | 'active' | 'finished'>('waiting');
+  const [waitingOpponentStep, setWaitingOpponentStep] = useState<boolean>(false);
 
   // Deterministic seed if in 4-digit private room
   const numericSeed = roomCode
@@ -97,9 +103,10 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
     : undefined;
 
   // 25 questions total (3 rounds * 8 questions = 24 + 1 Sudden Death question)
-  const [questions] = useState<QuizQuestion[]>(() =>
+  const [questions, setQuestions] = useState<QuizQuestion[]>(() =>
     getMatchQuestions(category, 25, account.seenQuestionIds, numericSeed)
   );
+  const appliedSeedsKeyRef = useRef<string>('');
 
   // Round & Question indices
   const [currentRound, setCurrentRound] = useState<number>(1); // 1..3
@@ -111,6 +118,27 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
   const [roundWinners, setRoundWinners] = useState<Array<'player' | 'opponent' | 'draw'>>([]);
   const [totalPlayerPoints, setTotalPlayerPoints] = useState<number>(0);
   const [totalOpponentPoints, setTotalOpponentPoints] = useState<number>(0);
+
+  // Real-time Room Synchronization Refs (for mode === 'room')
+  const isRoomHostRef = useRef<boolean>(true);
+  const phaseRef = useRef<MatchPhase>(phase);
+  phaseRef.current = phase;
+  const currentRoundRef = useRef<number>(currentRound);
+  currentRoundRef.current = currentRound;
+  const questionInRoundRef = useRef<number>(questionInRound);
+  questionInRoundRef.current = questionInRound;
+  const playerRoundPointsRef = useRef<number>(playerRoundPoints);
+  playerRoundPointsRef.current = playerRoundPoints;
+  const opponentRoundPointsRef = useRef<number>(opponentRoundPoints);
+  opponentRoundPointsRef.current = opponentRoundPoints;
+  const totalPlayerPointsRef = useRef<number>(totalPlayerPoints);
+  totalPlayerPointsRef.current = totalPlayerPoints;
+  const totalOpponentPointsRef = useRef<number>(totalOpponentPoints);
+  totalOpponentPointsRef.current = totalOpponentPoints;
+  const roundStartOpponentTotalRef = useRef<number>(0);
+  const myAnsweredStepRef = useRef<number>(0);
+  const remoteAnsweredStepRef = useRef<number>(0);
+  const stepAdvancedRef = useRef<number>(0);
 
   // Question timer (6 seconds standard) & Hardware Anti-Cheat Lock Ref
   const [timeLeft, setTimeLeft] = useState<number>(6);
@@ -191,10 +219,11 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
   // Background 15-second Anti-Cheat monitor for Online mode
   const bgEnteredAtRef = useRef<number | null>(null);
 
+  // In mode === 'room', both players answer every question on their own device in real time
   const isPlayerTurn =
     phase === 'SUDDEN_DEATH'
       ? true
-      : mode === 'solo'
+      : mode === 'solo' || mode === 'room'
       ? true
       : questionInRound % 2 === 1; // Q1, Q3, Q5, Q7 are Player 1; Q2, Q4, Q6, Q8 are Opponent/Player 2
 
@@ -206,35 +235,155 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
       ? 24
       : (currentRound - 1) * 8 + (questionInRound - 1);
 
+  const currentStepNumber = currentQuestionIndex + 1; // 1..24 for Rounds 1-3, 25 for Sudden Death
+
   const currentQuestion: QuizQuestion =
     questions[currentQuestionIndex] || questions[0];
 
   const categoryMeta =
     QUIZ_CATEGORIES.find(c => c.id === category) || QUIZ_CATEGORIES[0];
 
-  // 1. Matchmaking countdown & Real Cloud Room Subscription
+  // 1. Real Cloud Room Subscription (`onSnapshot` on `rooms/{roomCode}`)
   useEffect(() => {
-    if (!roomCode) return;
-    const unsub = subscribeToCloudRoom(roomCode, data => {
-      const hostName = String(data.hostName || '');
-      const guestName = String(data.guestName || '');
-      const isHost = hostName === account.username;
-      const remoteName = isHost ? guestName : hostName;
-      const remoteFlag = String(isHost ? data.guestFlag || '🇸🇦' : data.hostFlag || '🇸🇦');
+    if (mode !== 'room' || !roomCode) return;
 
-      if (remoteName && remoteName.length >= 2) {
+    const unsub = subscribeToCloudRoom(roomCode, data => {
+      const hostUid = String(data.hostUid || '');
+      const hostName = String(data.hostName || '');
+      const hostFlag = String(data.hostFlag || '🇸🇦');
+      const hostPlayerId = String(data.hostPlayerId || '');
+      const guestUid = String(data.guestUid || '');
+      const guestName = String(data.guestName || '');
+      const guestFlag = String(data.guestFlag || '🇸🇦');
+      const guestPlayerId = String(data.guestPlayerId || '');
+      const status = String(data.status || 'waiting') as 'waiting' | 'active' | 'finished';
+
+      setRoomCloudStatus(status);
+
+      // Determine whether this device is the Host or the Guest
+      const isHost =
+        (hostPlayerId && hostPlayerId === account.playerId) ||
+        (!guestPlayerId && hostName === account.username) ||
+        (hostName === account.username && guestName !== account.username);
+      isRoomHostRef.current = isHost;
+
+      const remoteName = isHost ? guestName : hostName;
+      const remoteFlag = isHost ? guestFlag : hostFlag;
+      const remotePid = isHost ? guestPlayerId : hostPlayerId;
+
+      if (remoteName && remoteName.trim().length >= 1) {
         setOpponentName(remoteName);
-        setOpponentFlag(remoteFlag);
+        setOpponentFlag(remoteFlag || '🇸🇦');
         setOpponentIsBot(false);
+        if (remotePid) {
+          setOpponentPlayerId(remotePid);
+        }
+      }
+
+      // Synchronize unified questionSeeds array from Firestore so both devices get identical questions
+      if (Array.isArray(data.questionSeeds) && data.questionSeeds.length > 0) {
+        const seedsArr = data.questionSeeds.map((n: unknown) => Number(n) || 0);
+        const key = seedsArr.join(',');
+        if (appliedSeedsKeyRef.current !== key) {
+          appliedSeedsKeyRef.current = key;
+          const qSeed = Number(data.questionSeed || numericSeed || 7);
+          setQuestions(
+            getMatchQuestions(
+              category,
+              25,
+              account.seenQuestionIds,
+              qSeed,
+              seedsArr
+            )
+          );
+        }
+      }
+
+      // Synchronize live scores and answered round/question step from the opponent's device
+      const remoteScore = Number(isHost ? data.guestScore ?? 0 : data.hostScore ?? 0);
+      const remoteAnswered = Number(
+        isHost ? data.guestAnsweredRound ?? 0 : data.hostAnsweredRound ?? 0
+      );
+      const remoteReadyBreak = Boolean(
+        isHost ? data.guestReadyNextRound : data.hostReadyNextRound
+      );
+
+      remoteAnsweredStepRef.current = remoteAnswered;
+      totalOpponentPointsRef.current = remoteScore;
+      setTotalOpponentPoints(remoteScore);
+
+      const computedOppRoundPts = Math.max(
+        0,
+        remoteScore - roundStartOpponentTotalRef.current
+      );
+      opponentRoundPointsRef.current = computedOppRoundPts;
+      setOpponentRoundPoints(computedOppRoundPts);
+
+      if (phaseRef.current === 'ROUND_BREAK' && remoteReadyBreak) {
+        setOpponentReadyBreak(true);
+      }
+
+      // Transition from MATCHMAKING ('waiting') -> PLAYING_ROUND ONLY when Guest actually joins and status === 'active'
+      if (
+        phaseRef.current === 'MATCHMAKING' &&
+        status === 'active' &&
+        (guestUid.length > 0 || guestName.length > 0)
+      ) {
+        soundFX.playCorrect();
+        answerLockRef.current = false;
+        setIsAnswerLocked(false);
+        setTimeLeft(6);
+        questionStartMsRef.current = Date.now();
+        setPhase('PLAYING_ROUND');
+      }
+
+      // During PLAYING_ROUND or SUDDEN_DEATH: if both devices have now answered the current step, advance immediately!
+      const activeStep =
+        phaseRef.current === 'SUDDEN_DEATH'
+          ? 25
+          : (currentRoundRef.current - 1) * 8 + questionInRoundRef.current;
+
+      if (
+        (phaseRef.current === 'PLAYING_ROUND' ||
+          phaseRef.current === 'SUDDEN_DEATH') &&
+        myAnsweredStepRef.current >= activeStep &&
+        remoteAnswered >= activeStep &&
+        stepAdvancedRef.current < activeStep
+      ) {
+        stepAdvancedRef.current = activeStep;
+        setWaitingOpponentStep(false);
+        window.setTimeout(() => {
+          proceedToNextRoomStep(activeStep);
+        }, 650);
+      }
+
+      // If opponent finished/forfeited early while we are still in an earlier round
+      if (
+        (status === 'finished' || status === 'completed') &&
+        phaseRef.current !== 'MATCH_OVER' &&
+        phaseRef.current !== 'MATCHMAKING' &&
+        remoteAnswered < 24 &&
+        myAnsweredStepRef.current > remoteAnswered + 1
+      ) {
+        triggerMatchEnd(
+          'forfeit_win',
+          'انسحب الخصم أو غادر الغرفة السحابية، وتم احتساب الفوز لصالحك!'
+        );
       }
     });
+
     return () => {
       if (unsub) unsub();
     };
-  }, [roomCode, account.username]);
+  }, [mode, roomCode, account.playerId, account.username, category]);
 
+  // 1B. Matchmaking countdown ONLY for `mode === 'online'` (NEVER for `mode === 'room'`)
   useEffect(() => {
     if (phase !== 'MATCHMAKING') return;
+    // CRITICAL: In `mode === 'room'`, never run a local timer or spawn a bot!
+    // Wait strictly for Firestore `onSnapshot` to report `status === 'active'`.
+    if (mode === 'room') return;
+
     const timer = setInterval(() => {
       setMatchmakingSec(prev => {
         if (prev <= 1) {
@@ -259,7 +408,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
       });
     }, 900);
     return () => clearInterval(timer);
-  }, [phase, customOpponentName]);
+  }, [phase, mode, customOpponentName]);
 
   // 2. Background Visibility Monitor (15s rule in Online mode)
   useEffect(() => {
@@ -320,10 +469,11 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
     return () => clearInterval(timer);
   }, [phase, currentRound, questionInRound, isAnswerLocked]);
 
-  // 4. Smart Bot AI automatic turn execution
+  // 4. Smart Bot AI automatic turn execution (STRICTLY DISABLED IN `mode === 'room'` AND `mode === 'local'`)
   useEffect(() => {
     if (phase !== 'PLAYING_ROUND') return;
-    if (isPlayerTurn || mode === 'local' || isAnswerLocked) return;
+    if (mode === 'room' || mode === 'local' || !opponentIsBot) return;
+    if (isPlayerTurn || isAnswerLocked) return;
 
     // Bot calculates accuracy and delay from difficulty & persona
     const diffAccuracyMap: Record<BotDifficulty, number> = {
@@ -353,7 +503,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
     }
 
     const botTimer = setTimeout(() => {
-      if (isAnswerLocked) return;
+      if (isAnswerLocked || mode === 'room') return;
       const willAnswerCorrectly = Math.random() < accuracy;
       let chosenIdx = currentQuestion.correctIndex;
       if (!willAnswerCorrectly) {
@@ -375,6 +525,8 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
     return () => clearTimeout(botTimer);
   }, [
     phase,
+    mode,
+    opponentIsBot,
     currentRound,
     questionInRound,
     isPlayerTurn,
@@ -385,10 +537,13 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
   useEffect(() => {
     if (phase !== 'ROUND_BREAK') return;
 
-    // Bot or remote opponent readies up after 2 seconds
-    const oppReadyTimer = setTimeout(() => {
-      setOpponentReadyBreak(true);
-    }, 1800);
+    // Only auto-ready in Bot/Local mode; in `mode === 'room'`, readiness comes from Firestore `onSnapshot`
+    let oppReadyTimer: ReturnType<typeof setTimeout> | null = null;
+    if (mode !== 'room') {
+      oppReadyTimer = setTimeout(() => {
+        setOpponentReadyBreak(true);
+      }, 1800);
+    }
 
     const breakInterval = setInterval(() => {
       setBreakTimeLeft(prev => {
@@ -412,30 +567,157 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
     }, 1000);
 
     return () => {
-      clearTimeout(oppReadyTimer);
+      if (oppReadyTimer) clearTimeout(oppReadyTimer);
       clearInterval(breakInterval);
     };
-  }, [phase, playerReadyBreak]);
+  }, [phase, mode, playerReadyBreak]);
 
   // Advance from Round Break as soon as both players click Ready
   useEffect(() => {
     if (phase === 'ROUND_BREAK' && playerReadyBreak && opponentReadyBreak) {
       const nextR = currentRound + 1;
+      if (mode === 'room' && roomCode) {
+        updateCloudRoomState(
+          roomCode,
+          isRoomHostRef.current
+            ? { hostReadyNextRound: false }
+            : { guestReadyNextRound: false }
+        ).catch(() => {});
+      }
       setTimeout(() => {
+        roundStartOpponentTotalRef.current = totalOpponentPointsRef.current;
         setCurrentRound(nextR);
         setQuestionInRound(1);
         setPlayerRoundPoints(0);
+        playerRoundPointsRef.current = 0;
         setOpponentRoundPoints(0);
+        opponentRoundPointsRef.current = 0;
         setHiddenOptions([]);
         setSelectedOption(null);
         setIsAnswerLocked(false);
+        setWaitingOpponentStep(false);
         answerLockRef.current = false;
         setTimeLeft(6);
         questionStartMsRef.current = Date.now();
         setPhase('PLAYING_ROUND');
       }, 500);
     }
-  }, [phase, playerReadyBreak, opponentReadyBreak, currentRound]);
+  }, [phase, mode, roomCode, playerReadyBreak, opponentReadyBreak, currentRound]);
+
+  /**
+   * Synchronizes the player's score and answered step to Firestore in `mode === 'room'`,
+   * then waits until both players have answered (or round question timer + grace completes)
+   * before advancing to the next question.
+   */
+  const syncAndCoordinateRoomStep = (newTotalPlayerScore: number, stepNum: number) => {
+    myAnsweredStepRef.current = stepNum;
+    if (roomCode) {
+      const payload = isRoomHostRef.current
+        ? {
+            hostScore: Math.min(500, newTotalPlayerScore),
+            hostAnsweredRound: stepNum,
+          }
+        : {
+            guestScore: Math.min(500, newTotalPlayerScore),
+            guestAnsweredRound: stepNum,
+          };
+      updateCloudRoomState(roomCode, payload).catch(() => {});
+    }
+
+    // If opponent already answered this step in Firestore, advance after brief visual feedback
+    if (remoteAnsweredStepRef.current >= stepNum) {
+      if (stepAdvancedRef.current < stepNum) {
+        stepAdvancedRef.current = stepNum;
+        setWaitingOpponentStep(false);
+        window.setTimeout(() => {
+          proceedToNextRoomStep(stepNum);
+        }, 850);
+      }
+      return;
+    }
+
+    // Otherwise, show waiting indicator until opponent answers OR the round question timer expires
+    setWaitingOpponentStep(true);
+    const maxWaitMs = Math.max(1500, timeLeft * 1000 + 2200);
+    window.setTimeout(() => {
+      if (stepAdvancedRef.current < stepNum && phaseRef.current !== 'MATCH_OVER') {
+        stepAdvancedRef.current = stepNum;
+        setWaitingOpponentStep(false);
+        proceedToNextRoomStep(stepNum);
+      }
+    }, maxWaitMs);
+  };
+
+  const proceedToNextRoomStep = (completedStep: number) => {
+    if (phaseRef.current === 'MATCH_OVER') return;
+
+    if (completedStep === 25 || phaseRef.current === 'SUDDEN_DEATH') {
+      const myTotal = totalPlayerPointsRef.current;
+      const oppTotal = totalOpponentPointsRef.current;
+      if (myTotal > oppTotal) {
+        triggerMatchEnd('win', 'حسمت المباراة في السؤال الفاصل الحاسم عبر الغرفة السحابية ⚡!');
+      } else if (oppTotal > myTotal) {
+        triggerMatchEnd('loss', 'حسم الخصم السؤال الفاصل الحاسم في الغرفة السحابية.');
+      } else {
+        triggerMatchEnd('win', 'تعادل مثير في السؤال الفاصل وتم حسم المواجهة لصالحك بأفضلية الأداء!');
+      }
+      return;
+    }
+
+    const qInR = questionInRoundRef.current;
+    const cRound = currentRoundRef.current;
+
+    if (qInR < 8) {
+      setQuestionInRound(qInR + 1);
+      setHiddenOptions([]);
+      setSelectedOption(null);
+      setIsAnswerLocked(false);
+      setWaitingOpponentStep(false);
+      answerLockRef.current = false;
+      setTimeLeft(6);
+      questionStartMsRef.current = Date.now();
+    } else {
+      // Completed 8 questions of the round in `mode === 'room'`
+      const myRoundPts = playerRoundPointsRef.current;
+      const oppRoundPts = opponentRoundPointsRef.current;
+      let rWinner: 'player' | 'opponent' | 'draw' = 'draw';
+      if (myRoundPts > oppRoundPts) rWinner = 'player';
+      else if (oppRoundPts > myRoundPts) rWinner = 'opponent';
+
+      setRoundWinners(prev => {
+        const nextWinners = [...prev, rWinner];
+        if (cRound < 3) {
+          setBreakTimeLeft(30);
+          setPlayerReadyBreak(false);
+          setOpponentReadyBreak(false);
+          setWaitingOpponentStep(false);
+          setPhase('ROUND_BREAK');
+        } else {
+          const pWins = nextWinners.filter(w => w === 'player').length;
+          const oWins = nextWinners.filter(w => w === 'opponent').length;
+          if (pWins > oWins) {
+            triggerMatchEnd('win', null);
+          } else if (oWins > pWins) {
+            triggerMatchEnd('loss', null);
+          } else if (totalPlayerPointsRef.current > totalOpponentPointsRef.current) {
+            triggerMatchEnd('win', null);
+          } else if (totalOpponentPointsRef.current > totalPlayerPointsRef.current) {
+            triggerMatchEnd('loss', null);
+          } else {
+            setHiddenOptions([]);
+            setSelectedOption(null);
+            setIsAnswerLocked(false);
+            setWaitingOpponentStep(false);
+            answerLockRef.current = false;
+            setTimeLeft(6);
+            questionStartMsRef.current = Date.now();
+            setPhase('SUDDEN_DEATH');
+          }
+        }
+        return nextWinners;
+      });
+    }
+  };
 
   const handleTimeoutAnswer = () => {
     if (isAnswerLocked || answerLockRef.current) return;
@@ -452,11 +734,16 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
     if (isPlayerTurn) {
       setComboCount(0);
     }
+    if (mode === 'room') {
+      syncAndCoordinateRoomStep(totalPlayerPointsRef.current, currentStepNumber);
+      return;
+    }
     setTimeout(() => advanceToNextStep(false), 1100);
   };
 
   const submitTurnAnswer = (optionIdx: number, isBotAction: boolean = false) => {
     if (isAnswerLocked || answerLockRef.current) return;
+    if (isBotAction && mode === 'room') return; // Double guard: never accept bot actions in rooms
     answerLockRef.current = true;
 
     // Anti-Cheat check for human touches (< 120ms impossible reaction speed)
@@ -495,7 +782,17 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         );
       }
 
-      // Resolve Sudden Death against opponent
+      if (mode === 'room') {
+        const nextTotal = isCorrect
+          ? totalPlayerPointsRef.current + 3
+          : totalPlayerPointsRef.current;
+        totalPlayerPointsRef.current = nextTotal;
+        setTotalPlayerPoints(nextTotal);
+        syncAndCoordinateRoomStep(nextTotal, 25);
+        return;
+      }
+
+      // Resolve Sudden Death against opponent in Online/Local mode
       setTimeout(() => {
         const oppCorrect = Math.random() < 0.65;
         const oppTime = 1600 + Math.floor(Math.random() * 2400);
@@ -510,6 +807,8 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
       return;
     }
 
+    let nextTotalPlayer = totalPlayerPointsRef.current;
+
     if (isPlayerTurn) {
       if (isCorrect) {
         const nextCombo = comboCount + 1;
@@ -522,8 +821,14 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
             : '🎵 إجابة صحيحة ✅',
           'border-[#38D9A9] text-[#38D9A9] bg-[#38D9A9]/15'
         );
-        setPlayerRoundPoints(prev => prev + pts);
-        setTotalPlayerPoints(prev => prev + pts);
+        const nextRoundPts = playerRoundPointsRef.current + pts;
+        playerRoundPointsRef.current = nextRoundPts;
+        setPlayerRoundPoints(nextRoundPts);
+
+        nextTotalPlayer = totalPlayerPointsRef.current + pts;
+        totalPlayerPointsRef.current = nextTotalPlayer;
+        setTotalPlayerPoints(nextTotalPlayer);
+
         setCorrectCountThisMatch(prev => prev + 1);
         if (isGoldenQuestion) {
           setGoldenCorrectThisMatch(prev => prev + 1);
@@ -568,6 +873,11 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
       }
     }
 
+    if (mode === 'room') {
+      syncAndCoordinateRoomStep(nextTotalPlayer, currentStepNumber);
+      return;
+    }
+
     setTimeout(() => advanceToNextStep(isCorrect), 1150);
   };
 
@@ -591,11 +901,6 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
       questionStartMsRef.current = Date.now();
     } else {
       // End of Round (8 questions completed)
-      if (roomCode) {
-        updateCloudRoomState(roomCode, {
-          hostScore: Math.min(100, totalPlayerPoints + (isPlayerTurn && wasCorrect ? pts : 0)),
-        }).catch(() => {});
-      }
       let rWinner: 'player' | 'opponent' | 'draw' = 'draw';
       if (updatedPlayerPts > updatedOppPts) rWinner = 'player';
       else if (updatedOppPts > updatedPlayerPts) rWinner = 'opponent';
@@ -641,6 +946,12 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
     setFinalOutcome(outcome);
     setForfeitReasonAr(reasonAr);
     setPhase('MATCH_OVER');
+
+    if (mode === 'room' && roomCode) {
+      updateCloudRoomState(roomCode, {
+        status: 'finished',
+      }).catch(() => {});
+    }
 
     if (outcome === 'forfeit_win') {
       soundFX.playForfeit();
@@ -946,18 +1257,33 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
 
   const locCategory = getLocalizedCategory(categoryMeta, account.language);
 
-  // RENDER 1: Matchmaking Lobby
+  // RENDER 1: Matchmaking Lobby / Real Firestore Waiting Room (`status === 'waiting'`)
   if (phase === 'MATCHMAKING') {
+    const isPrivateWaitingRoom = mode === 'room';
     return (
       <div className="min-h-[82vh] flex flex-col items-center justify-center px-4 text-center">
         <div className="w-full max-w-md rounded-3xl bg-[#111827] border border-[#28354E] p-8 shadow-2xl">
           <div className="text-4xl mb-3">{categoryMeta.icon}</div>
           <h2 className="text-xl font-extrabold text-white mb-1">
-            {roomCode ? `#${roomCode} · ${locCategory.name}` : locCategory.name}
+            {roomCode ? `غرفة التحدي #${roomCode} · ${locCategory.name}` : locCategory.name}
           </h2>
-          <p className="text-xs text-slate-400 mb-6">
-            {vt.searchingOpponentText}
+          <p className="text-xs text-slate-300 mb-3">
+            {isPrivateWaitingRoom
+              ? '⏳ شاشة انتظار حقيقية (متصلة بـ Cloud Firestore): لن يبدأ السؤال الأول إلا عند دخول اللاعب الثاني فعلياً للغرفة!'
+              : vt.searchingOpponentText}
           </p>
+
+          {isPrivateWaitingRoom && roomCode && (
+            <div className="mb-4 px-4 py-2.5 rounded-2xl bg-[#070A12] border border-[#FFD166]/60 inline-flex items-center gap-2">
+              <span className="text-xs text-slate-400">كود الغرفة:</span>
+              <span className="text-lg font-mono-num font-extrabold text-[#FFD166] tracking-widest">
+                #{roomCode}
+              </span>
+              <span className="px-2 py-0.5 rounded-lg bg-[#4FF5D2]/15 text-[#4FF5D2] text-[10px] font-extrabold">
+                الحالة: {roomCloudStatus === 'waiting' ? 'بانتظار الخصم (waiting)' : 'نشطة (active)'}
+              </span>
+            </div>
+          )}
 
           <div className="flex items-center justify-around my-6">
             <div className="flex flex-col items-center">
@@ -972,12 +1298,20 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
 
             <div className="flex flex-col items-center">
               <div className="w-16 h-16 rounded-2xl bg-[#1B253B] border border-[#28354E] flex items-center justify-center text-3xl mb-2 animate-pulse">
-                🔍
+                {isPrivateWaitingRoom ? customOpponentFlag || '⏳' : '🔍'}
               </div>
               <span className="text-sm font-bold text-slate-300">
-                {vt.startingInSec} {matchmakingSec}s
+                {isPrivateWaitingRoom
+                  ? customOpponentName
+                    ? `بانتظار قبول ${customOpponentName}...`
+                    : 'بانتظار انضمام اللاعب الثاني...'
+                  : `${vt.startingInSec} ${matchmakingSec}s`}
               </span>
-              <span className="text-[11px] text-slate-500">Fair Play Arena</span>
+              <span className="text-[11px] text-[#4FF5D2] font-mono-num">
+                {isPrivateWaitingRoom
+                  ? customOpponentPlayerId || 'بدون بوت نهائياً (100% Real Player)'
+                  : 'Fair Play Arena'}
+              </span>
             </div>
           </div>
 
@@ -1047,6 +1381,14 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
             onClick={() => {
               soundFX.playClick();
               setPlayerReadyBreak(true);
+              if (mode === 'room' && roomCode) {
+                updateCloudRoomState(
+                  roomCode,
+                  isRoomHostRef.current
+                    ? { hostReadyNextRound: true }
+                    : { guestReadyNextRound: true }
+                ).catch(() => {});
+              }
             }}
             className="w-full min-h-[50px] rounded-2xl bg-gradient-to-r from-[#4FF5D2] to-[#38D9A9] text-[#070A12] font-extrabold text-sm shadow-lg disabled:opacity-60"
           >
@@ -1384,7 +1726,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           {/* Opponent Card */}
           <div
             className={`relative p-3 rounded-2xl border transition-all ${
-              !isPlayerTurn
+              !isPlayerTurn || mode === 'room'
                 ? 'bg-[#1B253B] border-[#A78BFA] shadow-[0_0_18px_rgba(167,139,250,0.25)]'
                 : 'bg-[#070A12]/60 border-[#28354E] opacity-75'
             }`}
@@ -1423,6 +1765,10 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         <div className="text-xs font-bold">
           {phase === 'SUDDEN_DEATH' ? (
             <span className="text-[#FFD166]">⚡ Sudden Death!</span>
+          ) : mode === 'room' && waitingOpponentStep ? (
+            <span className="text-[#FFD166] animate-pulse">
+              ⏳ تم تسجيل إجابتك — بانتظار إجابة {opponentName} للانتقال للسؤال التالي...
+            </span>
           ) : isPlayerTurn ? (
             <span className="text-[#4FF5D2]">{vt.yourTurnBanner}</span>
           ) : mode === 'local' ? (

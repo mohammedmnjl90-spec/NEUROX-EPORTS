@@ -11,7 +11,10 @@ import {
 } from './data/constants';
 import {
   getActiveAccount,
+  loadHourlyAdConfig,
+  loadPlaytimeSeconds,
   persistUpdatedAccount,
+  savePlaytimeSeconds,
   setActiveAccountUid,
   updatePlayerProfileIdentity,
 } from './services/storage';
@@ -19,12 +22,14 @@ import {
   createCloudPrivateRoom,
   joinCloudPrivateRoom,
   subscribeToIncomingCloudChallenges,
+  subscribeToMyCloudProfileUpdates,
 } from './services/firebase';
 import {
   CategoryId,
   ChallengeNotificationItem,
   FriendItem,
   GameMode,
+  HourlyAdConfig,
   LanguageCode,
   MatchHistoryItem,
   PlayerAccount,
@@ -276,6 +281,16 @@ export default function App() {
   const [homeEditCountryCode, setHomeEditCountryCode] = useState<string>('SA');
   const [homeEditError, setHomeEditError] = useState<string | null>(null);
 
+  // Hourly Playtime Tracker (3600s = 60 minutes) & Interstitial Ad Modal State
+  const [playtimeSeconds, setPlaytimeSeconds] = useState<number>(() => {
+    const acc = getActiveAccount();
+    return acc ? loadPlaytimeSeconds(acc.uid, acc.playtimeSeconds ?? 0) : 0;
+  });
+  const [hourlyAdModalOpen, setHourlyAdModalOpen] = useState<boolean>(false);
+  const [hourlyAdCountdown, setHourlyAdCountdown] = useState<number>(7);
+  const [activeHourlyAdConfig, setActiveHourlyAdConfig] =
+    useState<HourlyAdConfig>(() => loadHourlyAdConfig());
+
   // Sync audio/vibration & RTL/LTR language direction when account changes
   useEffect(() => {
     if (!account) return;
@@ -286,6 +301,101 @@ export default function App() {
     document.documentElement.dir = langMeta.dir;
     document.documentElement.lang = account.language;
   }, [account]);
+
+  // Real-time Firestore listener for 1-Click VIP / Coins / Ban updates from Owner Control Panel
+  useEffect(() => {
+    if (!account || !isOnline) return;
+    const unsub = subscribeToMyCloudProfileUpdates(account, remotePatch => {
+      const nextAcc: PlayerAccount = {
+        ...account,
+        ...remotePatch,
+        updatedAt: Date.now(),
+      };
+      const res = persistUpdatedAccount(nextAcc);
+      setAccount({ ...res.account });
+      if (remotePatch.vipTier && remotePatch.vipTier !== account.vipTier) {
+        const pkg = VIP_PACKAGES.find(p => p.id === remotePatch.vipTier);
+        if (pkg && pkg.id !== 'basic') {
+          savePlaytimeSeconds(account.uid, 0);
+          setPlaytimeSeconds(0);
+          setHourlyAdModalOpen(false);
+          showToast(
+            `👑 تم تفعيل ${pkg.nameAr} ${pkg.badge} في حسابك وإيقاف الإعلانات التلقائية فوراً!`
+          );
+        }
+      }
+    });
+    return () => unsub();
+  }, [account, isOnline]);
+
+  // Background Hourly Playtime Tracker (60 minutes = 3600 seconds)
+  // Exempts VIP subscribers (bronze, silver, royal_gold) and never interrupts an active match
+  useEffect(() => {
+    if (!account) return;
+
+    // VIP Exception: Bronze, Silver, and Royal Gold subscribers have automatic ads completely disabled
+    if (account.vipTier !== 'basic') {
+      if (hourlyAdModalOpen) setHourlyAdModalOpen(false);
+      return;
+    }
+
+    const tick = window.setInterval(() => {
+      if (hourlyAdModalOpen) return;
+      const cfg = loadHourlyAdConfig();
+      if (!cfg.enabled) return;
+
+      setPlaytimeSeconds(prev => {
+        const next = prev + 1;
+        savePlaytimeSeconds(account.uid, next);
+        return next;
+      });
+    }, 1000);
+
+    return () => window.clearInterval(tick);
+  }, [account, hourlyAdModalOpen]);
+
+  // Trigger Full-Screen Interstitial Ad when playtime >= 3600s AND no match is active (!activeMatch)
+  useEffect(() => {
+    if (!account || account.vipTier !== 'basic') return;
+    if (activeMatch) return; // Never interrupt an active match! Wait until match completes.
+    if (hourlyAdModalOpen) return;
+
+    const cfg = loadHourlyAdConfig();
+    if (!cfg.enabled) return;
+    const targetInterval = cfg.intervalSeconds || 3600;
+
+    if (playtimeSeconds >= targetInterval) {
+      setActiveHourlyAdConfig(cfg);
+      setHourlyAdCountdown(cfg.countdownSeconds || 7);
+      setHourlyAdModalOpen(true);
+    }
+  }, [playtimeSeconds, activeMatch, account, hourlyAdModalOpen]);
+
+  // Countdown timer inside the Hourly Interstitial Ad Modal
+  useEffect(() => {
+    if (!hourlyAdModalOpen) return;
+    if (hourlyAdCountdown <= 0) return;
+
+    const timer = window.setTimeout(() => {
+      setHourlyAdCountdown(prev => Math.max(0, prev - 1));
+    }, 1000);
+
+    return () => window.clearTimeout(timer);
+  }, [hourlyAdModalOpen, hourlyAdCountdown]);
+
+  const handleDismissHourlyAd = (goToVipStore = false) => {
+    if (hourlyAdCountdown > 0 && !goToVipStore) return;
+    soundFX.playClick();
+    setHourlyAdModalOpen(false);
+    setPlaytimeSeconds(0);
+    if (account) {
+      savePlaytimeSeconds(account.uid, 0);
+    }
+    if (goToVipStore) {
+      setActiveMatch(null);
+      setActiveTab('store');
+    }
+  };
 
   // Prevent accidental exit via phone Back button without confirmation modal
   useEffect(() => {
@@ -1867,6 +1977,100 @@ export default function App() {
               >
                 {t.backToHomeBtn}
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Hourly Interstitial Ad Modal (Triggers after 60 minutes of playtime for non-VIP players, never during a match) */}
+      {hourlyAdModalOpen && !activeMatch && account.vipTier === 'basic' && (
+        <div
+          dir="rtl"
+          className="fixed inset-0 z-50 bg-black/90 backdrop-blur-md flex items-center justify-center p-4"
+        >
+          <div className="w-full max-w-xl rounded-3xl bg-[#111827] border-2 border-[#FFD166] overflow-hidden shadow-[0_0_60px_rgba(255,209,102,0.3)]">
+            {/* Top Bar with Countdown or Close Button */}
+            <div className="bg-[#070A12] px-5 py-3.5 border-b border-[#28354E] flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <span className="px-2.5 py-0.5 rounded-md bg-[#FFD166]/20 border border-[#FFD166] text-[10px] font-extrabold text-[#FFD166]">
+                  إعلان ساعي · NEUROX ADS
+                </span>
+                <span className="text-xs text-slate-400">
+                  أكملت 60 دقيقة من اللعب التنافسي
+                </span>
+              </div>
+
+              {hourlyAdCountdown > 0 ? (
+                <div className="px-3.5 py-1 rounded-xl bg-[#1B253B] border border-[#FFD166] text-xs font-mono-num font-extrabold text-[#FFD166]">
+                  يمكنك الإغلاق بعد {hourlyAdCountdown} ثوانٍ
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => handleDismissHourlyAd(false)}
+                  className="px-4 py-1.5 rounded-xl bg-[#38D9A9] text-[#070A12] text-xs font-extrabold flex items-center gap-1 shadow-md"
+                >
+                  <span>إغلاق الإعلان ومتابعة اللعب ✕</span>
+                </button>
+              )}
+            </div>
+
+            {/* Ad Banner Image or Video */}
+            {activeHourlyAdConfig.bannerImageUrl && (
+              <div className="relative h-52 sm:h-64 w-full bg-[#070A12] overflow-hidden">
+                <img
+                  src={activeHourlyAdConfig.bannerImageUrl}
+                  alt={activeHourlyAdConfig.adTitle}
+                  className="w-full h-full object-cover opacity-90"
+                />
+                <div className="absolute inset-0 bg-gradient-to-t from-[#111827] via-transparent to-transparent" />
+              </div>
+            )}
+
+            {/* Ad Content & VIP Upgrade CTA */}
+            <div className="p-6 text-center space-y-4">
+              <h3 className="text-lg sm:text-xl font-extrabold text-white">
+                {activeHourlyAdConfig.adTitle}
+              </h3>
+              <p className="text-xs sm:text-sm text-slate-300 leading-relaxed">
+                {activeHourlyAdConfig.adDescription}
+              </p>
+
+              <div className="flex flex-col sm:flex-row items-center justify-center gap-3 pt-2">
+                {activeHourlyAdConfig.targetLinkUrl &&
+                activeHourlyAdConfig.targetLinkUrl.startsWith('http') ? (
+                  <a
+                    href={activeHourlyAdConfig.targetLinkUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    onClick={() => handleDismissHourlyAd(false)}
+                    className="w-full sm:flex-1 min-h-[46px] px-5 rounded-2xl bg-gradient-to-r from-[#FFD166] to-[#F59E0B] text-[#070A12] text-xs sm:text-sm font-extrabold shadow-lg flex items-center justify-center"
+                  >
+                    {activeHourlyAdConfig.ctaButtonText ||
+                      '👑 اشترك في باقات VIP وأوقف الإعلانات نهائياً'}
+                  </a>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => handleDismissHourlyAd(true)}
+                    className="w-full sm:flex-1 min-h-[46px] px-5 rounded-2xl bg-gradient-to-r from-[#FFD166] to-[#F59E0B] text-[#070A12] text-xs sm:text-sm font-extrabold shadow-lg"
+                  >
+                    {activeHourlyAdConfig.ctaButtonText ||
+                      '👑 اشترك في باقات VIP وأوقف الإعلانات نهائياً'}
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  disabled={hourlyAdCountdown > 0}
+                  onClick={() => handleDismissHourlyAd(false)}
+                  className="w-full sm:w-auto min-h-[46px] px-5 rounded-2xl bg-[#1B253B] hover:bg-[#28354E] border border-[#28354E] text-xs font-bold text-slate-200 disabled:opacity-40"
+                >
+                  {hourlyAdCountdown > 0
+                    ? `انتظر (${hourlyAdCountdown}s)`
+                    : 'تخطي الإعلان ✕'}
+                </button>
+              </div>
             </div>
           </div>
         </div>

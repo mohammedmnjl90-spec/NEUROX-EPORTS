@@ -12,10 +12,26 @@ import {
   syncPlayerToCloud,
 } from '../services/firebase';
 import {
+  deleteOwnerPromoVipCode,
+  generateOwnerPromoVipCode,
+  loadHourlyAdConfig,
   loadOwnerPlayerOverrides,
+  loadPromoVipCodes,
+  loadVipPaymentRequests,
+  ownerActivatePlayerVipInCloudAndLocal,
+  saveHourlyAdConfig,
   saveOwnerPlayerOverride,
+  saveVipPaymentRequests,
 } from '../services/storage';
-import { CloudManagedPlayer, EconomyLedgerEntry, PlayerAccount } from '../types';
+import {
+  CloudManagedPlayer,
+  EconomyLedgerEntry,
+  HourlyAdConfig,
+  PlayerAccount,
+  PromoVipCode,
+  VipPaymentRequest,
+  VipTier,
+} from '../types';
 import { soundFX } from '../utils/sound';
 import {
   AlertTriangle,
@@ -23,13 +39,19 @@ import {
   Ban,
   CheckCircle2,
   Coins,
+  Copy,
+  CreditCard,
   Crown,
   Flame,
+  Megaphone,
+  Plus,
   Radar,
   Search,
   ShieldAlert,
   ShieldCheck,
   Sparkles,
+  Ticket,
+  Trash2,
   Trophy,
   Unlock,
   Users,
@@ -82,6 +104,28 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
       }
     >
   >({});
+
+  // Monetization 1: Ads & Promo/VIP Codes Management State
+  const [showAdsAndCodesPanel, setShowAdsAndCodesPanel] = useState<boolean>(true);
+  const [adConfig, setAdConfig] = useState<HourlyAdConfig>(() =>
+    loadHourlyAdConfig()
+  );
+  const [promoCodes, setPromoCodes] = useState<PromoVipCode[]>(() =>
+    loadPromoVipCodes()
+  );
+  const [newCodeRewardType, setNewCodeRewardType] = useState<'vip' | 'coins'>('vip');
+  const [newCodeVipTier, setNewCodeVipTier] = useState<VipTier>('royal_gold');
+  const [newCodeBonusCoins, setNewCodeBonusCoins] = useState<string>('250');
+  const [newCodeMaxUses, setNewCodeMaxUses] = useState<string>('1');
+  const [newCodeCustomStr, setNewCodeCustomStr] = useState<string>('');
+  const [newCodeNote, setNewCodeNote] = useState<string>('');
+
+  // Monetization 2: VIP Payment Requests State
+  const [showPaymentRequestsPanel, setShowPaymentRequestsPanel] =
+    useState<boolean>(true);
+  const [paymentRequests, setPaymentRequests] = useState<VipPaymentRequest[]>(
+    () => loadVipPaymentRequests()
+  );
 
   useEffect(() => {
     setMyCoinsInput(String(account.coins));
@@ -364,6 +408,125 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
     showFeedback(
       `🚨 تم تصفير نقاط وعملات جميع المرصودين في رادار التلاعب (${targets.length}) وحظرهم من المتصدرين!`
     );
+  };
+
+  // Save Hourly Ad & Payment Gateway Configuration
+  const handleSaveAdConfig = () => {
+    soundFX.playCorrect();
+    const saved = saveHourlyAdConfig(adConfig);
+    setAdConfig(saved);
+    showFeedback(
+      `📺 تم حفظ إعدادات إعلان الساعة التلقائي (${saved.countdownSeconds} ثوانٍ) وروابط بوابة الدفع بنجاح!`
+    );
+  };
+
+  // Generate a new Promo / VIP Activation Code
+  const handleCreatePromoCode = () => {
+    soundFX.playCorrect();
+    const created = generateOwnerPromoVipCode({
+      customCode: newCodeCustomStr,
+      rewardType: newCodeRewardType,
+      vipTier: newCodeVipTier,
+      bonusCoins: Math.max(0, Math.floor(Number(newCodeBonusCoins) || 0)),
+      maxUses: Math.max(1, Math.floor(Number(newCodeMaxUses) || 1)),
+      noteAr: newCodeNote,
+    });
+    setPromoCodes(loadPromoVipCodes());
+    setNewCodeCustomStr('');
+    setNewCodeNote('');
+    showFeedback(`🎟️ تم توليد كود الشحن الجديد (${created.code}) بنجاح!`);
+  };
+
+  // Delete a Promo / VIP Code
+  const handleDeletePromoCode = (codeStr: string) => {
+    soundFX.playClick();
+    const next = deleteOwnerPromoVipCode(codeStr);
+    setPromoCodes(next);
+    showFeedback(`🗑️ تم حذف الكود (${codeStr}) من القائمة.`);
+  };
+
+  // 1-Click Activate VIP Tier for any Player in Firestore & Local Registry
+  const handleQuickActivatePlayerVip = async (
+    target: CloudManagedPlayer,
+    tier: VipTier
+  ) => {
+    soundFX.playVictory();
+    setBusyPlayerId(target.playerId);
+    try {
+      const pkg = VIP_PACKAGES.find(p => p.id === tier) || VIP_PACKAGES[0];
+      if (
+        target.playerId === account.playerId ||
+        target.uid === account.uid
+      ) {
+        await handleUpdateMyOwnerAccount(
+          {
+            vipTier: tier,
+            coins: account.coins + pkg.instantCoins,
+          },
+          `تفعيل ${pkg.nameAr} من لوحة المالك`,
+          `👑 تم تفعيل ${pkg.nameAr} ${pkg.badge} لحسابك وإضافة +${pkg.instantCoins} عملة!`
+        );
+        return;
+      }
+
+      const updated = await ownerActivatePlayerVipInCloudAndLocal(target, tier);
+      setPlayers(prev =>
+        prev.map(p => (p.playerId === updated.playerId ? updated : p))
+      );
+      showFeedback(
+        `👑 تم تفعيل ${pkg.nameAr} ${pkg.badge} للاعب (${target.username} ${target.playerId}) في Firestore وإيقاف الإعلانات التلقائية عنه فوراً!`
+      );
+    } finally {
+      setBusyPlayerId(null);
+    }
+  };
+
+  // Approve or Reject a Player's VIP Subscription Request
+  const handleResolveVipPaymentRequest = async (
+    req: VipPaymentRequest,
+    approve: boolean
+  ) => {
+    soundFX.playClick();
+    if (approve) {
+      const targetPlayer = players.find(
+        p => p.playerId === req.playerId || p.uid === req.uid
+      ) || {
+        uid: req.uid,
+        playerId: req.playerId,
+        username: req.username,
+        countryCode: 'SA',
+        countryFlag: req.countryFlag || '🇸🇦',
+        xp: 0,
+        level: 1,
+        coins: 50,
+        monthlyPoints: 0,
+        rating: 1200,
+        vipTier: 'basic' as VipTier,
+        fairPlayScore: 100,
+        onlineWins: 0,
+        totalMatches: 0,
+        isBanned: false,
+      };
+      await handleQuickActivatePlayerVip(targetPlayer, req.requestedTier);
+    }
+
+    const nextReqs = paymentRequests.map(r =>
+      r.id === req.id
+        ? {
+            ...r,
+            status: (approve ? 'approved' : 'rejected') as
+              | 'approved'
+              | 'rejected',
+            processedAt: Date.now(),
+          }
+        : r
+    );
+    setPaymentRequests(nextReqs);
+    saveVipPaymentRequests(nextReqs);
+
+    if (!approve) {
+      showFeedback(`❌ تم رفض طلب الاشتراك الخاص باللاعب (${req.username}).`);
+    }
   };
 
   return (
@@ -744,6 +907,457 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
       )}
 
       {/* ====================================================================
+          SECTION 1.5: ADS & PROMO/VIP CODES MANAGEMENT (إدارة الإعلانات وأكواد الشحن)
+         ==================================================================== */}
+      <div className="rounded-3xl bg-[#111827] border border-[#4FF5D2]/60 p-5 space-y-5">
+        <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-[#28354E]">
+          <div className="flex items-center gap-2.5">
+            <div className="w-10 h-10 rounded-2xl bg-[#4FF5D2]/15 border border-[#4FF5D2] flex items-center justify-center text-[#4FF5D2]">
+              <Megaphone className="w-5 h-5" />
+            </div>
+            <div>
+              <h2 className="text-base font-extrabold text-white">
+                إدارة الإعلانات وأكواد الشحن (Ads & Promo/VIP Codes)
+              </h2>
+              <p className="text-xs text-slate-400">
+                توليد أكواد قسائم الشحن (لباقات VIP أو العملات) والتحكم في مدة وصورة/فيديو ورابط إعلان الساعة التلقائي
+              </p>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => {
+              soundFX.playClick();
+              setShowAdsAndCodesPanel(prev => !prev);
+            }}
+            className="min-h-[38px] px-3.5 rounded-xl bg-[#070A12] border border-[#28354E] text-xs font-bold text-[#4FF5D2]"
+          >
+            {showAdsAndCodesPanel ? 'طي القسم ▲' : 'عرض القسم ▼'}
+          </button>
+        </div>
+
+        {showAdsAndCodesPanel && (
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+            {/* Part A: Generate Promo / VIP Codes */}
+            <div className="p-4 rounded-2xl bg-[#070A12] border border-[#FFD166]/40 space-y-3.5">
+              <div className="flex items-center justify-between">
+                <h3 className="text-sm font-extrabold text-[#FFD166] flex items-center gap-1.5">
+                  <Ticket className="w-4 h-4" />
+                  <span>توليد أكواد قسائم شحن (VIP أو عملات ذهبية)</span>
+                </h3>
+                <span className="text-[11px] font-mono-num text-slate-400">
+                  الأكواد الفعالة: {promoCodes.length}
+                </span>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-300 mb-1">
+                    نوع مكافأة الكود
+                  </label>
+                  <select
+                    value={
+                      newCodeRewardType === 'coins'
+                        ? 'coins'
+                        : `vip_${newCodeVipTier}`
+                    }
+                    onChange={e => {
+                      const val = e.target.value;
+                      if (val === 'coins') {
+                        setNewCodeRewardType('coins');
+                        setNewCodeBonusCoins('500');
+                      } else {
+                        setNewCodeRewardType('vip');
+                        const tier = val.replace('vip_', '') as VipTier;
+                        setNewCodeVipTier(tier);
+                        const pkg = VIP_PACKAGES.find(p => p.id === tier);
+                        setNewCodeBonusCoins(String(pkg?.instantCoins ?? 250));
+                      }
+                    }}
+                    className="w-full min-h-[38px] rounded-xl bg-[#111827] border border-[#28354E] px-2.5 text-xs font-bold text-white"
+                  >
+                    <option value="vip_royal_gold">
+                      👑 الباقة الملكية الذهبية ($9.99) + 250 🪙
+                    </option>
+                    <option value="vip_silver">
+                      🥈 الباقة الفضية ($5.99) + 100 🪙
+                    </option>
+                    <option value="vip_bronze">
+                      🥉 الباقة البرونزية ($2.99) + 50 🪙
+                    </option>
+                    <option value="coins">🪙 شحن عملات ذهبية فقط</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-300 mb-1">
+                    العملات الذهبية المرفقة
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    value={newCodeBonusCoins}
+                    onChange={e => setNewCodeBonusCoins(e.target.value)}
+                    className="w-full min-h-[38px] rounded-xl bg-[#111827] border border-[#28354E] px-3 text-xs font-mono-num font-bold text-white"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-300 mb-1">
+                    كود مخصص (اختياري أو يولد آلياً)
+                  </label>
+                  <input
+                    type="text"
+                    dir="ltr"
+                    value={newCodeCustomStr}
+                    onChange={e =>
+                      setNewCodeCustomStr(e.target.value.toUpperCase())
+                    }
+                    placeholder="مثال: WALEED-VIP-99"
+                    className="w-full min-h-[38px] rounded-xl bg-[#111827] border border-[#28354E] px-3 text-xs font-mono-num font-bold text-[#FFD166]"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-300 mb-1">
+                    عدد مرات الاستخدام المسموحة
+                  </label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={10000}
+                    value={newCodeMaxUses}
+                    onChange={e => setNewCodeMaxUses(e.target.value)}
+                    className="w-full min-h-[38px] rounded-xl bg-[#111827] border border-[#28354E] px-3 text-xs font-mono-num font-bold text-white"
+                  />
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={handleCreatePromoCode}
+                className="w-full min-h-[40px] rounded-xl bg-gradient-to-r from-[#FFD166] to-[#F59E0B] text-[#070A12] text-xs font-extrabold flex items-center justify-center gap-1.5 shadow-md"
+              >
+                <Plus className="w-4 h-4" />
+                <span>توليد وحفظ كود الشحن الجديد فوراً</span>
+              </button>
+
+              {/* Active Promo Codes List */}
+              <div className="space-y-2 max-h-56 overflow-y-auto pt-2 border-t border-[#28354E]">
+                {promoCodes.map(item => (
+                  <div
+                    key={item.code}
+                    className="p-2.5 rounded-xl bg-[#111827] border border-[#28354E] flex flex-wrap items-center justify-between gap-2 text-xs"
+                  >
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span
+                          dir="ltr"
+                          className="font-mono-num font-extrabold text-[#FFD166]"
+                        >
+                          {item.code}
+                        </span>
+                        <span className="px-2 py-0.5 rounded-md bg-[#070A12] border border-[#28354E] text-[10px] font-mono-num text-slate-300">
+                          استخدم: {item.usedByPlayerIds.length}/{item.maxUses}
+                        </span>
+                      </div>
+                      <div className="text-[11px] text-slate-400 mt-0.5">
+                        {item.noteAr}
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          soundFX.playClick();
+                          navigator.clipboard
+                            .writeText(item.code)
+                            .catch(() => {});
+                          showFeedback(
+                            `📋 تم نسخ كود الشحن (${item.code}) لإرساله للاعب!`
+                          );
+                        }}
+                        className="px-2.5 py-1.5 rounded-lg bg-[#1B253B] hover:bg-[#28354E] text-[11px] font-bold text-[#4FF5D2] flex items-center gap-1"
+                      >
+                        <Copy className="w-3 h-3" />
+                        <span>نسخ</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleDeletePromoCode(item.code)}
+                        className="p-1.5 rounded-lg bg-[#FF6B81]/15 hover:bg-[#FF6B81] text-[#FF6B81] hover:text-[#070A12]"
+                        title="حذف الكود"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Part B: Hourly Interstitial Ad & Payment Links Configuration */}
+            <div className="p-4 rounded-2xl bg-[#070A12] border border-[#4FF5D2]/40 space-y-3">
+              <div className="flex items-center justify-between">
+                <h3 className="text-sm font-extrabold text-[#4FF5D2] flex items-center gap-1.5">
+                  <Megaphone className="w-4 h-4" />
+                  <span>إعدادات إعلان الساعة التلقائي وبنر المالك</span>
+                </h3>
+                <label className="flex items-center gap-2 text-xs font-extrabold text-[#38D9A9] cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={adConfig.enabled}
+                    onChange={e =>
+                      setAdConfig(prev => ({
+                        ...prev,
+                        enabled: e.target.checked,
+                      }))
+                    }
+                    className="w-4 h-4 accent-[#38D9A9]"
+                  />
+                  <span>تفعيل إعلان الساعة</span>
+                </label>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-300 mb-1">
+                    مدة العداد التنازلي للإعلان (ثوانٍ)
+                  </label>
+                  <input
+                    type="number"
+                    min={3}
+                    max={30}
+                    value={adConfig.countdownSeconds}
+                    onChange={e =>
+                      setAdConfig(prev => ({
+                        ...prev,
+                        countdownSeconds: Math.max(
+                          3,
+                          Math.min(30, Number(e.target.value) || 7)
+                        ),
+                      }))
+                    }
+                    className="w-full min-h-[38px] rounded-xl bg-[#111827] border border-[#28354E] px-3 text-xs font-mono-num font-bold text-white"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-300 mb-1">
+                    عنوان الإعلان الترويجي
+                  </label>
+                  <input
+                    type="text"
+                    value={adConfig.adTitle}
+                    onChange={e =>
+                      setAdConfig(prev => ({
+                        ...prev,
+                        adTitle: e.target.value,
+                      }))
+                    }
+                    className="w-full min-h-[38px] rounded-xl bg-[#111827] border border-[#28354E] px-3 text-xs font-bold text-white"
+                  />
+                </div>
+
+                <div className="sm:col-span-2">
+                  <label className="block text-[11px] font-bold text-slate-300 mb-1">
+                    رابط صورة البنر الإعلاني (Image URL) أو الفيديو
+                  </label>
+                  <input
+                    type="text"
+                    dir="ltr"
+                    value={adConfig.bannerImageUrl}
+                    onChange={e =>
+                      setAdConfig(prev => ({
+                        ...prev,
+                        bannerImageUrl: e.target.value,
+                      }))
+                    }
+                    placeholder="https://..."
+                    className="w-full min-h-[38px] rounded-xl bg-[#111827] border border-[#28354E] px-3 text-xs font-mono-num text-white"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-300 mb-1">
+                    الرابط المستهدف عند الضغط على الإعلان
+                  </label>
+                  <input
+                    type="text"
+                    dir="ltr"
+                    value={adConfig.targetLinkUrl}
+                    onChange={e =>
+                      setAdConfig(prev => ({
+                        ...prev,
+                        targetLinkUrl: e.target.value,
+                      }))
+                    }
+                    placeholder="#vip-store أو https://..."
+                    className="w-full min-h-[38px] rounded-xl bg-[#111827] border border-[#28354E] px-3 text-xs font-mono-num text-white"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-300 mb-1">
+                    معلومات التحويل المحلي والتواصل مع المالك
+                  </label>
+                  <input
+                    type="text"
+                    value={adConfig.ownerContactInfo}
+                    onChange={e =>
+                      setAdConfig(prev => ({
+                        ...prev,
+                        ownerContactInfo: e.target.value,
+                      }))
+                    }
+                    className="w-full min-h-[38px] rounded-xl bg-[#111827] border border-[#28354E] px-3 text-xs text-white"
+                  />
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={handleSaveAdConfig}
+                className="w-full min-h-[40px] rounded-xl bg-gradient-to-r from-[#4FF5D2] to-[#38D9A9] text-[#070A12] text-xs font-extrabold shadow-md"
+              >
+                💾 حفظ إعدادات إعلان الساعة وبوابة الدفع
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* ====================================================================
+          SECTION 1.8: VIP PAYMENT REQUESTS (طلبات الدفع وتفعيل VIP المباشرة)
+         ==================================================================== */}
+      <div className="rounded-3xl bg-[#111827] border border-[#38D9A9]/60 p-5 space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2.5">
+            <div className="w-10 h-10 rounded-2xl bg-[#38D9A9]/15 border border-[#38D9A9] flex items-center justify-center text-[#38D9A9]">
+              <CreditCard className="w-5 h-5" />
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <h2 className="text-base font-extrabold text-white">
+                  طلبات الدفع وتفعيل باقات VIP (Payment Requests)
+                </h2>
+                <span className="px-2.5 py-0.5 rounded-full bg-[#FFD166] text-[#070A12] text-xs font-mono-num font-extrabold">
+                  {
+                    paymentRequests.filter(r => r.status === 'pending')
+                      .length
+                  }{' '}
+                  بانتظار التفعيل
+                </span>
+              </div>
+              <p className="text-xs text-slate-400">
+                طلبات الاشتراك والتحويل المرسلة من اللاعبين مع تفعيل فوري بضغطة زر واحدة في Cloud Firestore
+              </p>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => {
+              soundFX.playClick();
+              setPaymentRequests(loadVipPaymentRequests());
+              setShowPaymentRequestsPanel(prev => !prev);
+            }}
+            className="min-h-[38px] px-3.5 rounded-xl bg-[#070A12] border border-[#28354E] text-xs font-bold text-[#38D9A9]"
+          >
+            {showPaymentRequestsPanel ? 'طي الطلبات ▲' : 'عرض الطلبات ▼'}
+          </button>
+        </div>
+
+        {showPaymentRequestsPanel && (
+          <div className="space-y-2.5">
+            {paymentRequests.length === 0 ? (
+              <div className="p-6 rounded-2xl bg-[#070A12] border border-[#28354E] text-center text-xs text-slate-400">
+                لا توجد طلبات اشتراك معلقة حالياً. يمكنك أيضاً تفعيل أي باقة VIP لأي لاعب مباشرة من قائمته بالأسفل بضغطة زر!
+              </div>
+            ) : (
+              paymentRequests.map(req => {
+                const pkg =
+                  VIP_PACKAGES.find(p => p.id === req.requestedTier) ||
+                  VIP_PACKAGES[3];
+                return (
+                  <div
+                    key={req.id}
+                    className={`p-3.5 rounded-2xl border flex flex-wrap items-center justify-between gap-3 ${
+                      req.status === 'pending'
+                        ? 'bg-[#070A12] border-[#FFD166]'
+                        : req.status === 'approved'
+                        ? 'bg-[#070A12]/60 border-[#38D9A9]/40'
+                        : 'bg-[#070A12]/40 border-[#FF6B81]/40'
+                    }`}
+                  >
+                    <div className="flex items-center gap-3">
+                      <span className="text-2xl">{req.countryFlag}</span>
+                      <div>
+                        <div className="flex flex-wrap items-center gap-2 text-xs font-extrabold text-white">
+                          <span>{req.username}</span>
+                          <span
+                            dir="ltr"
+                            className="font-mono-num text-[#FFD166]"
+                          >
+                            {req.playerId}
+                          </span>
+                          <span className="px-2 py-0.5 rounded-md bg-[#111827] border border-[#FFD166]/50 text-[#FFD166]">
+                            {pkg.badge} {pkg.nameAr} ({req.priceUsdText})
+                          </span>
+                        </div>
+                        <div className="text-[11px] text-slate-300 mt-1">
+                          المرجع / الحوالة: {req.transferReference}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      {req.status === 'pending' ? (
+                        <>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleResolveVipPaymentRequest(req, true)
+                            }
+                            className="min-h-[36px] px-4 rounded-xl bg-[#38D9A9] text-[#070A12] text-xs font-extrabold"
+                          >
+                            ✅ موافقة وتفعيل VIP فوراً
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleResolveVipPaymentRequest(req, false)
+                            }
+                            className="min-h-[36px] px-3 rounded-xl bg-[#FF6B81]/20 text-[#FF6B81] text-xs font-extrabold"
+                          >
+                            ❌ رفض
+                          </button>
+                        </>
+                      ) : (
+                        <span
+                          className={`px-3 py-1 rounded-xl text-xs font-extrabold ${
+                            req.status === 'approved'
+                              ? 'bg-[#38D9A9]/20 text-[#38D9A9]'
+                              : 'bg-[#FF6B81]/20 text-[#FF6B81]'
+                          }`}
+                        >
+                          {req.status === 'approved'
+                            ? '✓ تم التفعيل'
+                            : '✕ مرفوض'}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* ====================================================================
           SECTION 2: ANTI-CHEAT RADAR BANNER (رادار التلاعب التلقائي <80)
          ==================================================================== */}
       <div className="rounded-3xl bg-gradient-to-r from-[#111827] via-[#2A121D] to-[#111827] border-2 border-[#FF6B81]/80 p-5">
@@ -1045,6 +1659,37 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
                           </>
                         )}
                       </button>
+                    </div>
+                  </div>
+
+                  {/* 1-Click VIP Tier Activation Bar for this Player */}
+                  <div className="mb-3 p-2.5 rounded-2xl bg-[#111827] border border-[#FFD166]/40 flex flex-wrap items-center justify-between gap-2">
+                    <div className="text-xs font-extrabold text-[#FFD166] flex items-center gap-1.5">
+                      <Crown className="w-3.5 h-3.5" />
+                      <span>تفعيل باقة VIP بضغطة زر (Firestore):</span>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      {VIP_PACKAGES.map(pkg => {
+                        const isCurrentVip = player.vipTier === pkg.id;
+                        return (
+                          <button
+                            key={pkg.id}
+                            type="button"
+                            disabled={busyPlayerId === player.playerId}
+                            onClick={() =>
+                              handleQuickActivatePlayerVip(player, pkg.id)
+                            }
+                            className={`px-3 py-1.5 rounded-xl text-[11px] font-extrabold border transition-all ${
+                              isCurrentVip
+                                ? 'bg-[#FFD166] text-[#070A12] border-[#FFD166] shadow-md'
+                                : 'bg-[#070A12] hover:bg-[#1B253B] text-slate-300 border-[#28354E]'
+                            }`}
+                          >
+                            {pkg.badge} {pkg.nameAr}
+                            {isCurrentVip ? ' (مفعلة ✓)' : ''}
+                          </button>
+                        );
+                      })}
                     </div>
                   </div>
 

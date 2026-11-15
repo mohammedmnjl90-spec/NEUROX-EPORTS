@@ -525,7 +525,11 @@ export const FriendsAndChatView: React.FC<FriendsAndChatViewProps> = ({
     setFavoriteOnlineAlertFriend(null);
 
     try {
-      const created = await sendQuickChallengeInvite(account, quickCategory);
+      const created = await sendQuickChallengeInvite(
+        account,
+        quickCategory,
+        friend.playerId
+      );
       const code =
         created?.roomCode ||
         Math.floor(1000 + Math.random() * 9000).toString();

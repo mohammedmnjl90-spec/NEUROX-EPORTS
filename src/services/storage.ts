@@ -1,16 +1,31 @@
-import { ACHIEVEMENTS_LIST, computeLevelInfo, WORLD_COUNTRIES } from '../data/constants';
+import {
+  ACHIEVEMENTS_LIST,
+  computeLevelInfo,
+  PROFILE_BORDERS_CATALOG,
+  UI_THEMES_CATALOG,
+  VIP_PACKAGES,
+  WORLD_COUNTRIES,
+} from '../data/constants';
 import {
   ChatMessageItem,
   CloudManagedPlayer,
   EconomyLedgerEntry,
+  HourlyAdConfig,
   PlayerAccount,
+  PromoVipCode,
+  VipPaymentRequest,
+  VipTier,
 } from '../types';
-import { syncPlayerToCloud } from './firebase';
+import { ownerMutatePlayerInFirestore, syncPlayerToCloud } from './firebase';
 
 const ACTIVE_USER_KEY = 'neurox_active_uid_v1';
 const ACCOUNTS_REGISTRY_KEY = 'neurox_accounts_registry_v1';
 const CHAT_MESSAGES_KEY = 'neurox_chat_messages_v1';
 const OWNER_PLAYER_OVERRIDES_KEY = 'neurox_owner_player_overrides_v1';
+const PLAYTIME_TRACKER_PREFIX = 'neurox_playtime_sec_v1_';
+const HOURLY_AD_CONFIG_KEY = 'neurox_hourly_ad_config_v1';
+const PROMO_VIP_CODES_KEY = 'neurox_promo_vip_codes_v1';
+const VIP_PAYMENT_REQUESTS_KEY = 'neurox_vip_payment_requests_v1';
 
 export function loadOwnerPlayerOverrides(): Record<string, CloudManagedPlayer> {
   try {
@@ -62,6 +77,28 @@ export function getTodayDateStr(): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
+export function loadPlaytimeSeconds(uid: string, fallback = 0): number {
+  try {
+    const raw = localStorage.getItem(`${PLAYTIME_TRACKER_PREFIX}${uid}`);
+    if (raw === null) return Math.max(0, Math.floor(Number(fallback) || 0));
+    return Math.max(0, Math.floor(Number(raw) || 0));
+  } catch {
+    return Math.max(0, Math.floor(Number(fallback) || 0));
+  }
+}
+
+export function savePlaytimeSeconds(uid: string, seconds: number): void {
+  try {
+    const safeSec = Math.max(0, Math.floor(Number(seconds) || 0));
+    localStorage.setItem(`${PLAYTIME_TRACKER_PREFIX}${uid}`, String(safeSec));
+    const registry = loadAllAccounts();
+    if (registry[uid]) {
+      registry[uid].playtimeSeconds = safeSec;
+      saveAllAccounts(registry);
+    }
+  } catch {}
+}
+
 export function sanitizeAccount(rawAcc: PlayerAccount): PlayerAccount {
   const today = getTodayDateStr();
   const safeXp = Math.max(0, Math.floor(Number(rawAcc.xp) || 0));
@@ -76,6 +113,11 @@ export function sanitizeAccount(rawAcc: PlayerAccount): PlayerAccount {
     };
   }
 
+  // Apply any owner override if present
+  const overrides = loadOwnerPlayerOverrides();
+  const ov = overrides[rawAcc.playerId] || overrides[rawAcc.uid];
+  const effectiveVipTier = ov?.vipTier || rawAcc.vipTier || 'basic';
+
   return {
     ...rawAcc,
     xp: safeXp,
@@ -83,9 +125,10 @@ export function sanitizeAccount(rawAcc: PlayerAccount): PlayerAccount {
     coins: safeCoins,
     monthlyPoints: Math.max(0, Math.floor(Number(rawAcc.monthlyPoints) || 0)),
     rating: Math.max(0, Math.floor(Number(rawAcc.rating ?? 1200))),
-    vipTier: rawAcc.vipTier || 'basic',
+    vipTier: effectiveVipTier,
     fairPlayScore: Math.max(0, Math.min(100, Math.floor(Number(rawAcc.fairPlayScore ?? 100)))),
-    isBanned: Boolean(rawAcc.isBanned),
+    playtimeSeconds: loadPlaytimeSeconds(rawAcc.uid, rawAcc.playtimeSeconds ?? 0),
+    isBanned: Boolean(ov ? ov.isBanned : rawAcc.isBanned),
     lifelines: {
       fiftyFifty: Math.max(0, Math.floor(Number(rawAcc.lifelines?.fiftyFifty ?? 1))),
       freezeTime: Math.max(0, Math.floor(Number(rawAcc.lifelines?.freezeTime ?? 1))),
@@ -463,3 +506,397 @@ export function appendFriendChatMessage(msg: ChatMessageItem) {
     console.error('Failed to save chat message', e);
   }
 }
+
+// ============================================================================
+// MONETIZATION 1: HOURLY INTERSTITIAL AD SYSTEM & OWNER AD CONFIGURATION
+// ============================================================================
+
+export const DEFAULT_HOURLY_AD_CONFIG: HourlyAdConfig = {
+  enabled: true,
+  intervalSeconds: 3600, // 60 minutes = 3600 seconds
+  countdownSeconds: 7, // 7 seconds countdown before dismissal
+  adTitle: '👑 ارتقِ بتجربتك في NEUROX ESPORTS إلى مستوى الأساطير!',
+  adDescription:
+    'احصل على الباقة الملكية الذهبية (VIP) الآن واستمتع بلعب متواصل بدون أي إعلانات تلقائية، مع +250 عملة ذهبية فورية ومضاعفة مكافآت الفوز ووسائل المساعدة الذكية!',
+  bannerImageUrl:
+    'https://images.unsplash.com/photo-1542751371-adc38448a05e?auto=format&fit=crop&w=1200&q=80',
+  videoUrl: '',
+  targetLinkUrl: '#vip-store',
+  ctaButtonText: '👑 استكشف باقات VIP وأوقف الإعلانات فوراً',
+  stripeBronzeUrl: 'https://checkout.stripe.com/pay/neurox_vip_bronze_299',
+  stripeSilverUrl: 'https://checkout.stripe.com/pay/neurox_vip_silver_599',
+  stripeGoldUrl: 'https://checkout.stripe.com/pay/neurox_vip_royal_gold_999',
+  paypalCheckoutUrl: 'https://www.paypal.com/checkoutnow?token=NEUROX_VIP_PASS',
+  ownerContactInfo: 'تواصل مع الإدارة عبر واتساب أو تيليجرام للحصول على كود التفعيل الفوري بعد التحويل',
+  updatedAt: Date.now(),
+};
+
+export function loadHourlyAdConfig(): HourlyAdConfig {
+  try {
+    const raw = localStorage.getItem(HOURLY_AD_CONFIG_KEY);
+    if (!raw) return { ...DEFAULT_HOURLY_AD_CONFIG };
+    const parsed = JSON.parse(raw);
+    return {
+      ...DEFAULT_HOURLY_AD_CONFIG,
+      ...parsed,
+      intervalSeconds: Math.max(60, Math.floor(Number(parsed.intervalSeconds) || 3600)),
+      countdownSeconds: Math.max(3, Math.min(30, Math.floor(Number(parsed.countdownSeconds) || 7))),
+    };
+  } catch {
+    return { ...DEFAULT_HOURLY_AD_CONFIG };
+  }
+}
+
+export function saveHourlyAdConfig(config: HourlyAdConfig): HourlyAdConfig {
+  const sanitized: HourlyAdConfig = {
+    ...DEFAULT_HOURLY_AD_CONFIG,
+    ...config,
+    intervalSeconds: Math.max(60, Math.floor(Number(config.intervalSeconds) || 3600)),
+    countdownSeconds: Math.max(3, Math.min(30, Math.floor(Number(config.countdownSeconds) || 7))),
+    updatedAt: Date.now(),
+  };
+  try {
+    localStorage.setItem(HOURLY_AD_CONFIG_KEY, JSON.stringify(sanitized));
+  } catch (e) {
+    console.error('Failed to save hourly ad config', e);
+  }
+  return sanitized;
+}
+
+// ============================================================================
+// MONETIZATION 2: VIP / PROMO CODES & DIRECT VIP PACKAGE ACTIVATION
+// ============================================================================
+
+const INITIAL_PROMO_VIP_CODES: PromoVipCode[] = [
+  {
+    code: 'VIP-ROYAL-2026',
+    rewardType: 'vip',
+    vipTier: 'royal_gold',
+    bonusCoins: 250,
+    maxUses: 100,
+    usedByPlayerIds: [],
+    noteAr: 'قسيمة تفعيل الباقة الملكية الذهبية 👑 + 250 عملة',
+    createdAt: Date.now(),
+  },
+  {
+    code: 'VIP-SILVER-2026',
+    rewardType: 'vip',
+    vipTier: 'silver',
+    bonusCoins: 100,
+    maxUses: 100,
+    usedByPlayerIds: [],
+    noteAr: 'قسيمة تفعيل الباقة الفضية 🥈 + 100 عملة',
+    createdAt: Date.now(),
+  },
+  {
+    code: 'VIP-BRONZE-2026',
+    rewardType: 'vip',
+    vipTier: 'bronze',
+    bonusCoins: 50,
+    maxUses: 100,
+    usedByPlayerIds: [],
+    noteAr: 'قسيمة تفعيل الباقة البرونزية 🥉 + 50 عملة',
+    createdAt: Date.now(),
+  },
+  {
+    code: 'NEUROX-500',
+    rewardType: 'coins',
+    bonusCoins: 500,
+    maxUses: 200,
+    usedByPlayerIds: [],
+    noteAr: 'قسيمة شحن 500 عملة ذهبية 🪙',
+    createdAt: Date.now(),
+  },
+];
+
+export function loadPromoVipCodes(): PromoVipCode[] {
+  try {
+    const raw = localStorage.getItem(PROMO_VIP_CODES_KEY);
+    if (!raw) {
+      localStorage.setItem(PROMO_VIP_CODES_KEY, JSON.stringify(INITIAL_PROMO_VIP_CODES));
+      return [...INITIAL_PROMO_VIP_CODES];
+    }
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) && parsed.length > 0 ? parsed : [...INITIAL_PROMO_VIP_CODES];
+  } catch {
+    return [...INITIAL_PROMO_VIP_CODES];
+  }
+}
+
+export function savePromoVipCodes(codes: PromoVipCode[]): void {
+  try {
+    localStorage.setItem(PROMO_VIP_CODES_KEY, JSON.stringify(codes));
+  } catch (e) {
+    console.error('Failed to save promo VIP codes', e);
+  }
+}
+
+export function generateOwnerPromoVipCode(params: {
+  customCode?: string;
+  rewardType: 'vip' | 'coins';
+  vipTier?: VipTier;
+  bonusCoins: number;
+  maxUses: number;
+  noteAr?: string;
+}): PromoVipCode {
+  const existing = loadPromoVipCodes();
+  const randomSuffix = Math.random().toString(36).substring(2, 6).toUpperCase();
+  const prefix =
+    params.rewardType === 'vip'
+      ? params.vipTier === 'royal_gold'
+        ? 'ROYAL'
+        : params.vipTier === 'silver'
+        ? 'SILVER'
+        : 'BRONZE'
+      : 'COINS';
+
+  const cleanCode = (params.customCode || `${prefix}-${randomSuffix}-${Math.floor(100 + Math.random() * 900)}`)
+    .trim()
+    .toUpperCase();
+
+  const pkgMeta = VIP_PACKAGES.find(p => p.id === params.vipTier);
+
+  const newCode: PromoVipCode = {
+    code: cleanCode,
+    rewardType: params.rewardType,
+    vipTier: params.rewardType === 'vip' ? params.vipTier || 'royal_gold' : undefined,
+    bonusCoins: Math.max(0, Math.floor(Number(params.bonusCoins) || 0)),
+    maxUses: Math.max(1, Math.floor(Number(params.maxUses) || 1)),
+    usedByPlayerIds: [],
+    noteAr:
+      params.noteAr?.trim() ||
+      (params.rewardType === 'vip'
+        ? `كود تفعيل ${pkgMeta?.nameAr || 'VIP'} + ${params.bonusCoins} عملة`
+        : `كود شحن +${params.bonusCoins} عملة ذهبية`),
+    createdAt: Date.now(),
+  };
+
+  const next = [newCode, ...existing.filter(c => c.code.toUpperCase() !== cleanCode)];
+  savePromoVipCodes(next);
+  return newCode;
+}
+
+export function deleteOwnerPromoVipCode(codeStr: string): PromoVipCode[] {
+  const existing = loadPromoVipCodes();
+  const next = existing.filter(c => c.code.toUpperCase() !== codeStr.toUpperCase());
+  savePromoVipCodes(next);
+  return next;
+}
+
+/**
+ * Applies a VIP package upgrade to a PlayerAccount (grants instant coins, lifelines,
+ * unlocks royal border if royal_gold, resets hourly ad timer, and logs in Economy Ledger).
+ */
+export function applyVipPackageToAccount(
+  account: PlayerAccount,
+  tier: VipTier,
+  paymentMethodReason: string,
+  extraCoins = 0
+): PlayerAccount {
+  const pkg = VIP_PACKAGES.find(p => p.id === tier) || VIP_PACKAGES[0];
+  const totalBonusCoins = pkg.instantCoins + Math.max(0, extraCoins);
+  const nextCoins = account.coins + totalBonusCoins;
+
+  const entry: EconomyLedgerEntry = {
+    id: `ldg_vip_${tier}_${Date.now()}`,
+    timestamp: Date.now(),
+    type: 'credit',
+    amount: totalBonusCoins,
+    reason: `${paymentMethodReason} — ${pkg.nameAr} (+${totalBonusCoins} 🪙)`,
+    balanceAfter: nextCoins,
+  };
+
+  const nextOwnedBorders = account.ownedBorders || ['default_cyan'];
+  const unlockedRoyalBorders =
+    tier === 'royal_gold'
+      ? Array.from(new Set([...nextOwnedBorders, ...PROFILE_BORDERS_CATALOG.map(b => b.id)]))
+      : nextOwnedBorders;
+
+  const nextOwnedThemes = account.ownedThemes || ['midnight_cyan'];
+  const unlockedRoyalThemes =
+    tier === 'royal_gold'
+      ? Array.from(new Set([...nextOwnedThemes, ...UI_THEMES_CATALOG.map(th => th.id)]))
+      : nextOwnedThemes;
+
+  // Reset hourly ad playtime counter when upgrading to VIP
+  savePlaytimeSeconds(account.uid, 0);
+
+  return {
+    ...account,
+    vipTier: tier,
+    coins: nextCoins,
+    playtimeSeconds: 0,
+    lifelines: {
+      fiftyFifty: account.lifelines.fiftyFifty + pkg.freeLifelinesEach,
+      freezeTime: account.lifelines.freezeTime + pkg.freeLifelinesEach,
+      autoSolve: account.lifelines.autoSolve + pkg.freeLifelinesEach,
+    },
+    ownedBorders: unlockedRoyalBorders,
+    equippedBorder:
+      tier === 'royal_gold' ? 'royal_gold_frame' : account.equippedBorder || 'default_cyan',
+    ownedThemes: unlockedRoyalThemes,
+    ledger: [entry, ...account.ledger.slice(0, 99)],
+    updatedAt: Date.now(),
+  };
+}
+
+export function redeemPromoVipCode(
+  account: PlayerAccount,
+  rawCodeInput: string
+): { updatedAccount?: PlayerAccount; messageAr: string; success: boolean } {
+  const clean = rawCodeInput.trim().toUpperCase();
+  if (!clean) {
+    return {
+      success: false,
+      messageAr: 'يرجى إدخال كود القسيمة أولاً.',
+    };
+  }
+
+  const codes = loadPromoVipCodes();
+  const idx = codes.findIndex(c => c.code.toUpperCase() === clean);
+  if (idx === -1) {
+    return {
+      success: false,
+      messageAr: 'كود القسيمة غير صحيح أو منتهي الصلاحية، تأكد من كتابته بشكل صحيح.',
+    };
+  }
+
+  const targetCode = codes[idx];
+  if (targetCode.usedByPlayerIds.includes(account.playerId)) {
+    return {
+      success: false,
+      messageAr: 'لقد قمت باستخدام كود القسيمة هذا مسبقاً على حسابك!',
+    };
+  }
+
+  if (targetCode.usedByPlayerIds.length >= targetCode.maxUses) {
+    return {
+      success: false,
+      messageAr: 'وصل هذا الكود إلى الحد الأقصى لعدد مرات الاستخدام.',
+    };
+  }
+
+  // Mark code as used by this player
+  const updatedCode: PromoVipCode = {
+    ...targetCode,
+    usedByPlayerIds: [...targetCode.usedByPlayerIds, account.playerId],
+  };
+  const nextCodes = [...codes];
+  nextCodes[idx] = updatedCode;
+  savePromoVipCodes(nextCodes);
+
+  if (targetCode.rewardType === 'vip' && targetCode.vipTier) {
+    const pkg = VIP_PACKAGES.find(p => p.id === targetCode.vipTier) || VIP_PACKAGES[3];
+    const extraCoins = Math.max(0, targetCode.bonusCoins - pkg.instantCoins);
+    const updatedAcc = applyVipPackageToAccount(
+      account,
+      targetCode.vipTier,
+      `تفعيل كود قسيمة شحن (${targetCode.code})`,
+      extraCoins
+    );
+    return {
+      success: true,
+      updatedAccount: updatedAcc,
+      messageAr: `🎉 تم شحن الكود (${targetCode.code}) وتفعيل ${pkg.nameAr} ${pkg.badge} وإيقاف الإعلانات التلقائية بنجاح!`,
+    };
+  } else {
+    const bonus = Math.max(10, targetCode.bonusCoins);
+    const nextCoins = account.coins + bonus;
+    const entry: EconomyLedgerEntry = {
+      id: `ldg_code_${Date.now()}`,
+      timestamp: Date.now(),
+      type: 'credit',
+      amount: bonus,
+      reason: `شحن كود مكافأة ذهبية (${targetCode.code})`,
+      balanceAfter: nextCoins,
+    };
+    const updatedAcc: PlayerAccount = {
+      ...account,
+      coins: nextCoins,
+      ledger: [entry, ...account.ledger.slice(0, 99)],
+      updatedAt: Date.now(),
+    };
+    return {
+      success: true,
+      updatedAccount: updatedAcc,
+      messageAr: `🪙 تم شحن الكود (${targetCode.code}) وإضافة +${bonus} عملة ذهبية إلى رصيدك فوراً!`,
+    };
+  }
+}
+
+// ============================================================================
+// MONETIZATION 3: VIP SUBSCRIPTION REQUESTS & 1-CLICK OWNER APPROVAL
+// ============================================================================
+
+export function loadVipPaymentRequests(): VipPaymentRequest[] {
+  try {
+    const raw = localStorage.getItem(VIP_PAYMENT_REQUESTS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+export function saveVipPaymentRequests(requests: VipPaymentRequest[]): void {
+  try {
+    localStorage.setItem(VIP_PAYMENT_REQUESTS_KEY, JSON.stringify(requests));
+  } catch (e) {
+    console.error('Failed to save VIP payment requests', e);
+  }
+}
+
+export function submitVipPaymentRequest(params: {
+  account: PlayerAccount;
+  requestedTier: VipTier;
+  priceUsdText: string;
+  paymentMethod: 'card' | 'paypal' | 'local_transfer';
+  transferReference: string;
+}): VipPaymentRequest {
+  const existing = loadVipPaymentRequests();
+  const req: VipPaymentRequest = {
+    id: `vipreq_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    uid: params.account.uid,
+    playerId: params.account.playerId,
+    username: params.account.username,
+    countryFlag: params.account.countryFlag,
+    requestedTier: params.requestedTier,
+    priceUsdText: params.priceUsdText,
+    paymentMethod: params.paymentMethod,
+    transferReference: params.transferReference.trim() || 'طلب تفعيل مباشر بعد التحويل',
+    status: 'pending',
+    createdAt: Date.now(),
+  };
+
+  saveVipPaymentRequests([req, ...existing.slice(0, 99)]);
+  return req;
+}
+
+export async function ownerActivatePlayerVipInCloudAndLocal(
+  targetPlayer: CloudManagedPlayer,
+  newTier: VipTier
+): Promise<CloudManagedPlayer> {
+  const pkg = VIP_PACKAGES.find(p => p.id === newTier) || VIP_PACKAGES[0];
+  const bonusCoins = pkg.instantCoins;
+  const updatedCloud = await ownerMutatePlayerInFirestore(targetPlayer, {
+    vipTier: newTier,
+    coins: targetPlayer.coins + bonusCoins,
+  });
+  saveOwnerPlayerOverride(updatedCloud);
+
+  // Also update full local account if this player exists in local registry
+  const registry = loadAllAccounts();
+  for (const [uid, acc] of Object.entries(registry)) {
+    if (acc.playerId === targetPlayer.playerId || acc.uid === targetPlayer.uid) {
+      registry[uid] = applyVipPackageToAccount(
+        acc,
+        newTier,
+        'تفعيل VIP مباشر من لوحة تحكم المالك'
+      );
+    }
+  }
+  saveAllAccounts(registry);
+  return updatedCloud;
+}
+

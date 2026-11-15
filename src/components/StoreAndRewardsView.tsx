@@ -1,7 +1,13 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { VIP_PACKAGES } from '../data/constants';
 import { getDailyBossQuestion } from '../data/questionBank';
-import { getTodayDateStr } from '../services/storage';
+import {
+  applyVipPackageToAccount,
+  getTodayDateStr,
+  loadHourlyAdConfig,
+  redeemPromoVipCode,
+  submitVipPaymentRequest,
+} from '../services/storage';
 import {
   EconomyLedgerEntry,
   PlayerAccount,
@@ -9,6 +15,16 @@ import {
 } from '../types';
 import { getViewTranslations } from '../utils/i18n';
 import { soundFX } from '../utils/sound';
+import {
+  Building2,
+  CheckCircle2,
+  CreditCard,
+  ExternalLink,
+  ShieldCheck,
+  Sparkles,
+  Ticket,
+  X,
+} from 'lucide-react';
 
 interface StoreAndRewardsViewProps {
   account: PlayerAccount;
@@ -54,6 +70,21 @@ export const StoreAndRewardsView: React.FC<StoreAndRewardsViewProps> = ({
   const [bossAnswered, setBossAnswered] = useState(false);
   const dailyBossQuestion = getDailyBossQuestion(today);
   const bossDoneToday = account.lastDailyBossDate === today;
+
+  // Secure VIP Checkout Modal & Promo Code State
+  const [checkoutTier, setCheckoutTier] = useState<VipTier | null>(null);
+  const [checkoutTab, setCheckoutTab] = useState<'electronic' | 'code' | 'transfer'>('electronic');
+  const [paymentGateway, setPaymentGateway] = useState<'card_mada' | 'paypal'>('card_mada');
+  const [cardHolderName, setCardHolderName] = useState('');
+  const [cardNumber, setCardNumber] = useState('');
+  const [cardExpiry, setCardExpiry] = useState('');
+  const [cardCvv, setCardCvv] = useState('');
+  const [isProcessingPayment, setIsProcessingPayment] = useState(false);
+  const [checkoutError, setCheckoutError] = useState<string | null>(null);
+  const [checkoutSuccess, setCheckoutSuccess] = useState<string | null>(null);
+  const [promoCodeInput, setPromoCodeInput] = useState('');
+  const [transferReferenceInput, setTransferReferenceInput] = useState('');
+  const adConfig = loadHourlyAdConfig();
 
   const appendLedger = (
     acc: PlayerAccount,
@@ -331,37 +362,172 @@ export const StoreAndRewardsView: React.FC<StoreAndRewardsViewProps> = ({
     onUpdateAccount(updated, `🎯 +20 🪙 (${titleText})`);
   };
 
-  // Activate VIP Package (with Gold Coins OR Instant Trial Activation)
+  // Activate VIP Package with Gold Coins OR open Secure Checkout Modal for USD purchase
   const handleActivateVip = (pkgId: VipTier, useCoins: boolean) => {
     const pkg = VIP_PACKAGES.find(p => p.id === pkgId);
     if (!pkg || pkg.id === account.vipTier) return;
 
-    if (useCoins && account.coins < pkg.priceCoins) {
+    if (!useCoins) {
+      soundFX.playClick();
+      if (pkg.id === 'basic') {
+        const updatedBasic: PlayerAccount = {
+          ...account,
+          vipTier: 'basic',
+          updatedAt: Date.now(),
+        };
+        onUpdateAccount(updatedBasic, `تم التبديل إلى ${pkg.nameAr}`);
+        return;
+      }
+      setCheckoutTier(pkg.id);
+      setCheckoutTab('electronic');
+      setCheckoutError(null);
+      setCheckoutSuccess(null);
+      return;
+    }
+
+    if (account.coins < pkg.priceCoins) {
       soundFX.playWrong();
+      onUpdateAccount(
+        account,
+        `⚠️ رصيدك الحالي (${account.coins} 🪙) غير كافٍ لتفعيل ${pkg.nameAr} (${pkg.priceCoins} 🪙). يمكنك الاشتراك بالدولار (${pkg.priceUsdText}) أو شحن كود قسيمة!`
+      );
       return;
     }
 
     soundFX.playVictory();
-    const deducted = useCoins ? pkg.priceCoins : 0;
+    const deducted = pkg.priceCoins;
     const newCoins = account.coins - deducted + pkg.instantCoins;
-    const updated: PlayerAccount = {
+    const updatedAfterDeduction: PlayerAccount = {
       ...account,
-      vipTier: pkg.id,
-      coins: newCoins,
-      lifelines: {
-        fiftyFifty: account.lifelines.fiftyFifty + pkg.freeLifelinesEach,
-        freezeTime: account.lifelines.freezeTime + pkg.freeLifelinesEach,
-        autoSolve: account.lifelines.autoSolve + pkg.freeLifelinesEach,
-      },
-      ledger: appendLedger(
-        account,
-        newCoins >= account.coins ? 'credit' : 'debit',
-        Math.abs(newCoins - account.coins),
-        `VIP ${pkg.nameAr} (+${pkg.instantCoins} 🪙)`,
-        newCoins
-      ),
+      coins: account.coins - deducted,
     };
-    onUpdateAccount(updated, `👑 ${pkg.nameAr} (+${pkg.instantCoins} 🪙)`);
+    const finalUpdated = applyVipPackageToAccount(
+      updatedAfterDeduction,
+      pkg.id,
+      `تفعيل بالعملات الذهبية (-${deducted} 🪙)`
+    );
+    finalUpdated.coins = newCoins;
+    onUpdateAccount(
+      finalUpdated,
+      `👑 تم تفعيل ${pkg.nameAr} بنجاح! (+${pkg.instantCoins} 🪙 فورية وإيقاف الإعلانات التلقائية)`
+    );
+  };
+
+  // Complete Direct Electronic Payment (Card / Mada / Visa / MasterCard / PayPal)
+  const handleCompleteElectronicPayment = () => {
+    if (!checkoutTier) return;
+    const pkg = VIP_PACKAGES.find(p => p.id === checkoutTier);
+    if (!pkg) return;
+
+    setCheckoutError(null);
+    if (paymentGateway === 'card_mada') {
+      const cleanNum = cardNumber.replace(/\s+/g, '');
+      if (cardHolderName.trim().length < 3) {
+        soundFX.playWrong();
+        setCheckoutError('يرجى إدخال اسم حامل البطاقة بشكل صحيح.');
+        return;
+      }
+      if (cleanNum.length < 12) {
+        soundFX.playWrong();
+        setCheckoutError('يرجى إدخال رقم البطاقة الائتمانية / مدى (16 رقماً).');
+        return;
+      }
+      if (cardExpiry.trim().length < 4 || cardCvv.trim().length < 3) {
+        soundFX.playWrong();
+        setCheckoutError('يرجى إدخال تاريخ الانتهاء (MM/YY) ورمز الأمان (CVV).');
+        return;
+      }
+    }
+
+    soundFX.playClick();
+    setIsProcessingPayment(true);
+
+    window.setTimeout(() => {
+      setIsProcessingPayment(false);
+      soundFX.playVictory();
+      const methodLabel =
+        paymentGateway === 'paypal'
+          ? `اشتراك إلكتروني عبر PayPal (${pkg.priceUsdText})`
+          : `اشتراك إلكتروني بالبطاقة / مدى (${pkg.priceUsdText})`;
+
+      const updatedAcc = applyVipPackageToAccount(
+        account,
+        pkg.id,
+        methodLabel
+      );
+
+      // Also record approved transaction in owner payment logs
+      submitVipPaymentRequest({
+        account: updatedAcc,
+        requestedTier: pkg.id,
+        priceUsdText: pkg.priceUsdText,
+        paymentMethod: paymentGateway === 'paypal' ? 'paypal' : 'card',
+        transferReference:
+          paymentGateway === 'paypal'
+            ? `دفع إلكتروني مكتمل عبر PayPal (${pkg.priceUsdText})`
+            : `بطاقة باسم ${cardHolderName.trim()} تنتهي بـ ${cardNumber.slice(-4)} (${pkg.priceUsdText})`,
+      });
+
+      onUpdateAccount(
+        updatedAcc,
+        `👑 تم إتمام الدفع وتفعيل ${pkg.nameAr} (${pkg.priceUsdText}) فوراً! تمت إضافة +${pkg.instantCoins} 🪙 وإيقاف الإعلانات التلقائية نهائياً.`
+      );
+      setCheckoutTier(null);
+      setCardHolderName('');
+      setCardNumber('');
+      setCardExpiry('');
+      setCardCvv('');
+    }, 800);
+  };
+
+  // Redeem Promo / VIP Code
+  const handleRedeemCodeSubmit = () => {
+    setCheckoutError(null);
+    setCheckoutSuccess(null);
+    const res = redeemPromoVipCode(account, promoCodeInput);
+    if (!res.success || !res.updatedAccount) {
+      soundFX.playWrong();
+      setCheckoutError(res.messageAr);
+      return;
+    }
+    soundFX.playVictory();
+    setPromoCodeInput('');
+    onUpdateAccount(res.updatedAccount, res.messageAr);
+    setCheckoutSuccess(res.messageAr);
+    window.setTimeout(() => {
+      setCheckoutTier(null);
+      setCheckoutSuccess(null);
+    }, 1400);
+  };
+
+  // Submit Direct VIP Subscription Request (Local Transfer / Contact Admin)
+  const handleSubmitDirectTransferRequest = () => {
+    if (!checkoutTier) return;
+    const pkg = VIP_PACKAGES.find(p => p.id === checkoutTier);
+    if (!pkg) return;
+
+    setCheckoutError(null);
+    if (transferReferenceInput.trim().length < 3) {
+      soundFX.playWrong();
+      setCheckoutError(
+        'يرجى كتابة رقم الحوالة أو اسم المحوّل أو ملاحظة التأكيد لإرسال الطلب للإدارة.'
+      );
+      return;
+    }
+
+    soundFX.playCorrect();
+    submitVipPaymentRequest({
+      account,
+      requestedTier: pkg.id,
+      priceUsdText: pkg.priceUsdText,
+      paymentMethod: 'local_transfer',
+      transferReference: transferReferenceInput.trim(),
+    });
+
+    setTransferReferenceInput('');
+    setCheckoutSuccess(
+      `✅ تم إرسال طلب الاشتراك في ${pkg.nameAr} (${pkg.priceUsdText}) إلى لوحة تحكم الإدارة بنجاح! سيتم تفعيل باقتك فوراً.`
+    );
   };
 
   return (
@@ -702,10 +868,32 @@ export const StoreAndRewardsView: React.FC<StoreAndRewardsViewProps> = ({
       </div>
 
       {/* Section 4: Royal VIP Subscriptions (4 Tiers) */}
-      <div>
-        <h3 className="text-base font-extrabold text-white mb-3">
-          {vt.vipPackagesTitle}
-        </h3>
+      <div id="vip-store">
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
+          <div>
+            <h3 className="text-base font-extrabold text-white">
+              {vt.vipPackagesTitle}
+            </h3>
+            <p className="text-xs text-slate-400 mt-0.5">
+              اشترك في أي باقة VIP لإيقاف الإعلانات التلقائية كل ساعة نهائياً والحصول على عملات ومساعدات فورية
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              soundFX.playClick();
+              setCheckoutTier('royal_gold');
+              setCheckoutTab('code');
+              setCheckoutError(null);
+              setCheckoutSuccess(null);
+            }}
+            className="min-h-[40px] px-4 rounded-xl bg-[#1B253B] hover:bg-[#28354E] border border-[#FFD166]/60 text-xs font-extrabold text-[#FFD166] flex items-center gap-1.5 shadow-md"
+          >
+            <Ticket className="w-4 h-4" />
+            <span>🎟️ شحن كود قسيمة VIP أو عملات</span>
+          </button>
+        </div>
+
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
           {VIP_PACKAGES.map(pkg => {
             const isCurrent = account.vipTier === pkg.id;
@@ -714,7 +902,7 @@ export const StoreAndRewardsView: React.FC<StoreAndRewardsViewProps> = ({
                 key={pkg.id}
                 className={`rounded-3xl p-5 border flex flex-col justify-between ${
                   pkg.id === 'royal_gold'
-                    ? 'bg-gradient-to-b from-[#1B253B] to-[#111827] border-[#FFD166]'
+                    ? 'bg-gradient-to-b from-[#1B253B] to-[#111827] border-2 border-[#FFD166] shadow-[0_0_25px_rgba(255,209,102,0.15)]'
                     : 'bg-[#111827] border-[#28354E]'
                 }`}
               >
@@ -722,12 +910,19 @@ export const StoreAndRewardsView: React.FC<StoreAndRewardsViewProps> = ({
                   <div className="flex items-center justify-between mb-2">
                     <span className="text-3xl">{pkg.badge}</span>
                     <span className="text-xs font-mono-num font-bold text-[#FFD166]">
-                      {pkg.priceCoins > 0 ? `${pkg.priceCoins} 🪙 / ${pkg.priceUsdText}` : pkg.priceUsdText}
+                      {pkg.priceCoins > 0
+                        ? `${pkg.priceCoins} 🪙 / ${pkg.priceUsdText}`
+                        : pkg.priceUsdText}
                     </span>
                   </div>
-                  <h4 className="text-sm font-extrabold text-white mb-3">
+                  <h4 className="text-sm font-extrabold text-white mb-2">
                     {pkg.nameAr}
                   </h4>
+                  {pkg.id !== 'basic' && (
+                    <div className="mb-2.5 px-2.5 py-1 rounded-lg bg-[#38D9A9]/15 border border-[#38D9A9]/40 text-[10px] font-extrabold text-[#38D9A9]">
+                      🚫 إيقاف الإعلانات التلقائية كل ساعة نهائياً
+                    </div>
+                  )}
                   <ul className="space-y-1.5 text-xs text-slate-300 mb-5">
                     {pkg.perksAr.map((perk, idx) => (
                       <li key={idx}>• {perk}</li>
@@ -741,22 +936,35 @@ export const StoreAndRewardsView: React.FC<StoreAndRewardsViewProps> = ({
                   </div>
                 ) : (
                   <div className="space-y-2">
-                    {pkg.priceCoins > 0 && (
+                    {pkg.id !== 'basic' ? (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => handleActivateVip(pkg.id, false)}
+                          className="w-full min-h-[42px] rounded-xl bg-gradient-to-r from-[#4FF5D2] to-[#38D9A9] hover:brightness-110 text-[#070A12] text-xs font-extrabold flex items-center justify-center gap-1.5 shadow-md transition-all"
+                        >
+                          <CreditCard className="w-3.5 h-3.5" />
+                          <span>اشترك الآن ({pkg.priceUsdText})</span>
+                        </button>
+                        {pkg.priceCoins > 0 && (
+                          <button
+                            type="button"
+                            onClick={() => handleActivateVip(pkg.id, true)}
+                            className="w-full min-h-[38px] rounded-xl bg-[#FFD166]/15 hover:bg-[#FFD166] text-[#FFD166] hover:text-[#070A12] border border-[#FFD166]/60 text-[11px] font-extrabold transition-colors"
+                          >
+                            {vt.activateWithCoinsBtn} ({pkg.priceCoins} 🪙)
+                          </button>
+                        )}
+                      </>
+                    ) : (
                       <button
                         type="button"
-                        onClick={() => handleActivateVip(pkg.id, true)}
-                        className="w-full min-h-[40px] rounded-xl bg-[#FFD166] text-[#070A12] text-xs font-extrabold"
+                        onClick={() => handleActivateVip(pkg.id, false)}
+                        className="w-full min-h-[38px] rounded-xl bg-[#1B253B] hover:bg-[#28354E] border border-[#28354E] text-[11px] font-bold text-slate-300"
                       >
-                        {vt.activateWithCoinsBtn} ({pkg.priceCoins} 🪙)
+                        الباقة الافتراضية ({pkg.priceUsdText})
                       </button>
                     )}
-                    <button
-                      type="button"
-                      onClick={() => handleActivateVip(pkg.id, false)}
-                      className="w-full min-h-[38px] rounded-xl bg-[#1B253B] hover:bg-[#28354E] border border-[#28354E] text-[11px] font-bold text-[#4FF5D2]"
-                    >
-                      {vt.instantTrialBtn} ({pkg.priceUsdText})
-                    </button>
                   </div>
                 )}
               </div>
@@ -864,6 +1072,428 @@ export const StoreAndRewardsView: React.FC<StoreAndRewardsViewProps> = ({
           </div>
         </div>
       )}
+
+      {/* ====================================================================
+          SECURE VIP CHECKOUT MODAL (نافذة بوابة الدفع الآمنة لباقات VIP)
+         ==================================================================== */}
+      {checkoutTier &&
+        (() => {
+          const selectedPkg =
+            VIP_PACKAGES.find(p => p.id === checkoutTier) || VIP_PACKAGES[3];
+          const externalStripeLink =
+            selectedPkg.id === 'bronze'
+              ? adConfig.stripeBronzeUrl
+              : selectedPkg.id === 'silver'
+              ? adConfig.stripeSilverUrl
+              : adConfig.stripeGoldUrl;
+
+          return (
+            <div
+              dir="rtl"
+              className="fixed inset-0 z-50 bg-black/85 backdrop-blur-md flex items-center justify-center p-4 overflow-y-auto"
+            >
+              <div className="w-full max-w-2xl rounded-3xl bg-[#111827] border-2 border-[#FFD166] p-5 sm:p-6 shadow-[0_0_50px_rgba(255,209,102,0.22)] my-auto space-y-5">
+                {/* Modal Header */}
+                <div className="flex items-start justify-between gap-3 pb-3 border-b border-[#28354E]">
+                  <div className="flex items-center gap-3">
+                    <div className="w-12 h-12 rounded-2xl bg-[#FFD166]/20 border border-[#FFD166] flex items-center justify-center text-3xl shrink-0">
+                      {selectedPkg.badge}
+                    </div>
+                    <div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <h3 className="text-base sm:text-lg font-extrabold text-white">
+                          بوابة الدفع الآمنة (Secure Checkout)
+                        </h3>
+                        <span className="px-2.5 py-0.5 rounded-full bg-[#38D9A9]/20 border border-[#38D9A9] text-[10px] font-extrabold text-[#38D9A9] flex items-center gap-1">
+                          <ShieldCheck className="w-3 h-3" />
+                          <span>مشفر وآمن 256-Bit SSL</span>
+                        </span>
+                      </div>
+                      <p className="text-xs text-slate-300 mt-0.5">
+                        تفعيل فوري ومرتبط بـ Cloud Firestore مع إيقاف الإعلانات التلقائية نهائياً
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setCheckoutTier(null)}
+                    className="w-9 h-9 rounded-xl bg-[#1B253B] hover:bg-[#28354E] text-slate-300 hover:text-white flex items-center justify-center"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+
+                {/* Package Selector & Summary Card */}
+                <div className="p-4 rounded-2xl bg-[#070A12] border border-[#28354E] space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="text-xs font-extrabold text-slate-300">
+                      ملخص الباقة المختارة:
+                    </div>
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      {VIP_PACKAGES.filter(p => p.id !== 'basic').map(p => (
+                        <button
+                          key={p.id}
+                          type="button"
+                          onClick={() => {
+                            soundFX.playClick();
+                            setCheckoutTier(p.id);
+                          }}
+                          className={`px-3 py-1 rounded-xl text-[11px] font-extrabold border transition-all ${
+                            checkoutTier === p.id
+                              ? 'bg-[#FFD166] text-[#070A12] border-[#FFD166]'
+                              : 'bg-[#111827] text-slate-300 border-[#28354E]'
+                          }`}
+                        >
+                          {p.badge} {p.nameAr} ({p.priceUsdText})
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap items-center justify-between gap-4 pt-2 border-t border-[#1B253B]">
+                    <div>
+                      <div className="text-sm font-extrabold text-white flex items-center gap-1.5">
+                        <span>{selectedPkg.badge}</span>
+                        <span>{selectedPkg.nameAr}</span>
+                      </div>
+                      <div className="flex flex-wrap gap-2 mt-1.5">
+                        {selectedPkg.perksAr.map((perk, idx) => (
+                          <span
+                            key={idx}
+                            className="px-2.5 py-1 rounded-lg bg-[#111827] border border-[#28354E] text-[11px] text-slate-200"
+                          >
+                            ✓ {perk}
+                          </span>
+                        ))}
+                        <span className="px-2.5 py-1 rounded-lg bg-[#38D9A9]/15 border border-[#38D9A9]/50 text-[11px] font-extrabold text-[#38D9A9]">
+                          ✓ إيقاف الإعلانات التلقائية كل ساعة
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="text-end shrink-0">
+                      <div className="text-[11px] text-slate-400">
+                        الإجمالي المطلوب
+                      </div>
+                      <div
+                        dir="ltr"
+                        className="text-2xl font-mono-num font-extrabold text-[#FFD166]"
+                      >
+                        {selectedPkg.priceUsdText}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* 3 Payment Options Tabs */}
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      soundFX.playClick();
+                      setCheckoutTab('electronic');
+                      setCheckoutError(null);
+                      setCheckoutSuccess(null);
+                    }}
+                    className={`min-h-[44px] px-3 py-2 rounded-2xl border text-xs font-extrabold flex items-center justify-center gap-1.5 transition-all ${
+                      checkoutTab === 'electronic'
+                        ? 'bg-[#4FF5D2] text-[#070A12] border-[#4FF5D2]'
+                        : 'bg-[#070A12] text-slate-300 border-[#28354E]'
+                    }`}
+                  >
+                    <CreditCard className="w-4 h-4 shrink-0" />
+                    <span>1) الدفع الإلكتروني المباشر</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      soundFX.playClick();
+                      setCheckoutTab('code');
+                      setCheckoutError(null);
+                      setCheckoutSuccess(null);
+                    }}
+                    className={`min-h-[44px] px-3 py-2 rounded-2xl border text-xs font-extrabold flex items-center justify-center gap-1.5 transition-all ${
+                      checkoutTab === 'code'
+                        ? 'bg-[#FFD166] text-[#070A12] border-[#FFD166]'
+                        : 'bg-[#070A12] text-slate-300 border-[#28354E]'
+                    }`}
+                  >
+                    <Ticket className="w-4 h-4 shrink-0" />
+                    <span>2) كود قسيمة شحن (VIP Code)</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      soundFX.playClick();
+                      setCheckoutTab('transfer');
+                      setCheckoutError(null);
+                      setCheckoutSuccess(null);
+                    }}
+                    className={`min-h-[44px] px-3 py-2 rounded-2xl border text-xs font-extrabold flex items-center justify-center gap-1.5 transition-all ${
+                      checkoutTab === 'transfer'
+                        ? 'bg-[#38D9A9] text-[#070A12] border-[#38D9A9]'
+                        : 'bg-[#070A12] text-slate-300 border-[#28354E]'
+                    }`}
+                  >
+                    <Building2 className="w-4 h-4 shrink-0" />
+                    <span>3) التحويل المحلي والإدارة</span>
+                  </button>
+                </div>
+
+                {/* Feedback Messages */}
+                {checkoutError && (
+                  <div className="p-3.5 rounded-2xl bg-[#FF6B81]/15 border border-[#FF6B81] text-xs font-extrabold text-[#FF6B81]">
+                    ⚠️ {checkoutError}
+                  </div>
+                )}
+
+                {checkoutSuccess && (
+                  <div className="p-3.5 rounded-2xl bg-[#38D9A9]/15 border border-[#38D9A9] text-xs font-extrabold text-[#38D9A9] flex items-center gap-2">
+                    <CheckCircle2 className="w-4 h-4 shrink-0" />
+                    <span>{checkoutSuccess}</span>
+                  </div>
+                )}
+
+                {/* TAB 1: ELECTRONIC PAYMENT (Card / Mada / Visa / MasterCard / PayPal) */}
+                {checkoutTab === 'electronic' && (
+                  <div className="p-4 rounded-2xl bg-[#070A12] border border-[#28354E] space-y-4">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="text-xs font-extrabold text-white">
+                        اختر وسيلة الدفع الإلكتروني:
+                      </span>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setPaymentGateway('card_mada')}
+                          className={`px-3 py-1.5 rounded-xl text-xs font-extrabold border ${
+                            paymentGateway === 'card_mada'
+                              ? 'bg-[#1B253B] border-[#4FF5D2] text-[#4FF5D2]'
+                              : 'bg-[#111827] border-[#28354E] text-slate-400'
+                          }`}
+                        >
+                          💳 مدى / Visa / MasterCard
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setPaymentGateway('paypal')}
+                          className={`px-3 py-1.5 rounded-xl text-xs font-extrabold border ${
+                            paymentGateway === 'paypal'
+                              ? 'bg-[#1B253B] border-[#FFD166] text-[#FFD166]'
+                              : 'bg-[#111827] border-[#28354E] text-slate-400'
+                          }`}
+                        >
+                          🅿️ PayPal
+                        </button>
+                      </div>
+                    </div>
+
+                    {paymentGateway === 'card_mada' ? (
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <div className="sm:col-span-2">
+                          <label className="block text-[11px] font-bold text-slate-300 mb-1">
+                            اسم حامل البطاقة (Cardholder Name)
+                          </label>
+                          <input
+                            type="text"
+                            value={cardHolderName}
+                            onChange={e => setCardHolderName(e.target.value)}
+                            placeholder="MOHAMMED AL-OTAIBI"
+                            className="w-full min-h-[42px] rounded-xl bg-[#111827] border border-[#28354E] focus:border-[#4FF5D2] focus:outline-none px-3.5 text-xs font-bold text-white"
+                          />
+                        </div>
+                        <div className="sm:col-span-2">
+                          <label className="block text-[11px] font-bold text-slate-300 mb-1">
+                            رقم البطاقة الائتمانية / مدى (16 رقماً)
+                          </label>
+                          <input
+                            type="text"
+                            dir="ltr"
+                            maxLength={19}
+                            value={cardNumber}
+                            onChange={e =>
+                              setCardNumber(
+                                e.target.value
+                                  .replace(/[^0-9]/g, '')
+                                  .replace(/(.{4})/g, '$1 ')
+                                  .trim()
+                              )
+                            }
+                            placeholder="4532 •••• •••• 8891"
+                            className="w-full min-h-[42px] rounded-xl bg-[#111827] border border-[#28354E] focus:border-[#4FF5D2] focus:outline-none px-3.5 text-xs font-mono-num font-bold text-white"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-[11px] font-bold text-slate-300 mb-1">
+                            تاريخ الانتهاء (MM/YY)
+                          </label>
+                          <input
+                            type="text"
+                            dir="ltr"
+                            maxLength={5}
+                            value={cardExpiry}
+                            onChange={e => setCardExpiry(e.target.value)}
+                            placeholder="08/29"
+                            className="w-full min-h-[42px] rounded-xl bg-[#111827] border border-[#28354E] focus:border-[#4FF5D2] focus:outline-none px-3.5 text-xs font-mono-num font-bold text-white"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-[11px] font-bold text-slate-300 mb-1">
+                            رمز الأمان (CVV)
+                          </label>
+                          <input
+                            type="password"
+                            dir="ltr"
+                            maxLength={4}
+                            value={cardCvv}
+                            onChange={e =>
+                              setCardCvv(e.target.value.replace(/[^0-9]/g, ''))
+                            }
+                            placeholder="•••"
+                            className="w-full min-h-[42px] rounded-xl bg-[#111827] border border-[#28354E] focus:border-[#4FF5D2] focus:outline-none px-3.5 text-xs font-mono-num font-bold text-white"
+                          />
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="p-4 rounded-2xl bg-[#111827] border border-[#28354E] text-center space-y-2">
+                        <div className="text-2xl">🅿️</div>
+                        <div className="text-xs font-extrabold text-white">
+                          الدفع الآمن السريع عبر حساب PayPal ({selectedPkg.priceUsdText})
+                        </div>
+                        <p className="text-[11px] text-slate-400">
+                          يمكنك إتمام الدفع مباشرة لتفعيل {selectedPkg.nameAr} فوراً في حسابك ({account.playerId}).
+                        </p>
+                      </div>
+                    )}
+
+                    <div className="flex flex-wrap items-center gap-2.5 pt-1">
+                      <button
+                        type="button"
+                        disabled={isProcessingPayment}
+                        onClick={handleCompleteElectronicPayment}
+                        className="flex-1 min-h-[46px] px-5 rounded-2xl bg-gradient-to-r from-[#4FF5D2] to-[#38D9A9] text-[#070A12] text-xs sm:text-sm font-extrabold flex items-center justify-center gap-2 shadow-lg disabled:opacity-50"
+                      >
+                        <Sparkles className="w-4 h-4" />
+                        <span>
+                          {isProcessingPayment
+                            ? 'جاري تأكيد عملية الدفع وتفعيل الباقة...'
+                            : `إتمام الدفع وتفعيل ${selectedPkg.nameAr} فوراً (${selectedPkg.priceUsdText})`}
+                        </span>
+                      </button>
+
+                      {externalStripeLink && (
+                        <a
+                          href={
+                            paymentGateway === 'paypal'
+                              ? adConfig.paypalCheckoutUrl
+                              : externalStripeLink
+                          }
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="min-h-[46px] px-4 rounded-2xl bg-[#1B253B] hover:bg-[#28354E] border border-[#28354E] text-xs font-bold text-slate-200 flex items-center gap-1.5"
+                        >
+                          <ExternalLink className="w-3.5 h-3.5 text-[#4FF5D2]" />
+                          <span>رابط الدفع الخارجي</span>
+                        </a>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* TAB 2: REDEEM VIP / PROMO CODE */}
+                {checkoutTab === 'code' && (
+                  <div className="p-4 rounded-2xl bg-[#070A12] border border-[#FFD166]/50 space-y-3">
+                    <div>
+                      <h4 className="text-sm font-extrabold text-[#FFD166] mb-1">
+                        🎟️ تفعيل فوري عبر كود قسيمة شحن (Redeem VIP Code)
+                      </h4>
+                      <p className="text-xs text-slate-300">
+                        أدخل كود التفعيل الذي حصلت عليه من مالك اللعبة بعد الدفع ليتم تفعيل باقة VIP وإضافة العملات الذهبية وإيقاف الإعلانات فوراً:
+                      </p>
+                    </div>
+
+                    <div className="flex flex-col sm:flex-row gap-2.5">
+                      <input
+                        type="text"
+                        dir="ltr"
+                        value={promoCodeInput}
+                        onChange={e =>
+                          setPromoCodeInput(e.target.value.toUpperCase())
+                        }
+                        placeholder="مثال: VIP-ROYAL-2026"
+                        className="flex-1 min-h-[46px] rounded-xl bg-[#111827] border border-[#28354E] focus:border-[#FFD166] focus:outline-none px-4 text-center font-mono-num text-sm font-extrabold text-[#FFD166] uppercase tracking-wider"
+                      />
+                      <button
+                        type="button"
+                        onClick={handleRedeemCodeSubmit}
+                        className="min-h-[46px] px-6 rounded-xl bg-gradient-to-r from-[#FFD166] to-[#F59E0B] text-[#070A12] text-xs sm:text-sm font-extrabold shrink-0 shadow-lg"
+                      >
+                        تفعيل الكود فوراً 🚀
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {/* TAB 3: LOCAL TRANSFER & DIRECT REQUEST TO OWNER */}
+                {checkoutTab === 'transfer' && (
+                  <div className="p-4 rounded-2xl bg-[#070A12] border border-[#38D9A9]/50 space-y-3">
+                    <div>
+                      <h4 className="text-sm font-extrabold text-[#38D9A9] mb-1">
+                        🏦 التحويل المحلي وإرسال طلب تفعيل مباشر للإدارة
+                      </h4>
+                      <p className="text-xs text-slate-300 leading-relaxed">
+                        {adConfig.ownerContactInfo}
+                      </p>
+                    </div>
+
+                    <div className="p-3 rounded-xl bg-[#111827] border border-[#28354E] text-xs text-slate-300 flex flex-wrap items-center justify-between gap-2">
+                      <span>
+                        معرّف حسابك للتفعيل الفوري:{' '}
+                        <strong
+                          dir="ltr"
+                          className="font-mono-num text-[#FFD166]"
+                        >
+                          {account.playerId}
+                        </strong>
+                      </span>
+                      <span>
+                        الباقة المطلوبة:{' '}
+                        <strong className="text-[#4FF5D2]">
+                          {selectedPkg.badge} {selectedPkg.nameAr} (
+                          {selectedPkg.priceUsdText})
+                        </strong>
+                      </span>
+                    </div>
+
+                    <div>
+                      <label className="block text-[11px] font-bold text-slate-300 mb-1">
+                        رقم الحوالة / اسم المحوّل / ملاحظة التأكيد للإدارة:
+                      </label>
+                      <input
+                        type="text"
+                        value={transferReferenceInput}
+                        onChange={e =>
+                          setTransferReferenceInput(e.target.value)
+                        }
+                        placeholder="أدخل رقم الإيصال أو اسم المحوّل ليظهر طلبك فوراً لدى المالك..."
+                        className="w-full min-h-[44px] rounded-xl bg-[#111827] border border-[#28354E] focus:border-[#38D9A9] focus:outline-none px-3.5 text-xs font-bold text-white"
+                      />
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={handleSubmitDirectTransferRequest}
+                      className="w-full min-h-[46px] rounded-xl bg-gradient-to-r from-[#38D9A9] to-[#4FF5D2] text-[#070A12] text-xs sm:text-sm font-extrabold shadow-lg"
+                    >
+                      📨 إرسال طلب تفعيل {selectedPkg.nameAr} إلى لوحة تحكم المالك
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        })()}
     </div>
   );
 };

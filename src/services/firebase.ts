@@ -147,6 +147,42 @@ async function testConnection() {
 }
 testConnection();
 
+/**
+ * Active real-world internet + Firestore reachability heartbeat check (called every 4 seconds).
+ * Does not rely solely on `navigator.onLine`; performs a live network fetch probe with a short
+ * timeout so disconnecting Wi-Fi/data or losing real internet access is detected immediately.
+ */
+export async function checkRealInternetAndFirebaseConnection(): Promise<boolean> {
+  if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    return false;
+  }
+  if (typeof window === 'undefined') {
+    return true;
+  }
+
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), 3000);
+
+  try {
+    const res = await fetch(
+      `${window.location.origin}/?neurox_hb=${Date.now()}`,
+      {
+        method: 'HEAD',
+        cache: 'no-store',
+        signal: controller.signal,
+      }
+    );
+    window.clearTimeout(timeoutId);
+    if (!res.ok && res.status !== 304) {
+      return false;
+    }
+    return true;
+  } catch {
+    window.clearTimeout(timeoutId);
+    return false;
+  }
+}
+
 export async function linkGoogleCloudAccount(): Promise<User | null> {
   const provider = new GoogleAuthProvider();
   const result = await signInWithPopup(auth, provider);
@@ -373,15 +409,45 @@ export async function findCloudPlayerByIdentifier(
   }
 }
 
+export function generateRoomQuestionSeeds(
+  baseSeed: number,
+  count = 25
+): number[] {
+  const seeds: number[] = [];
+  let state = Math.max(1, Math.abs(Math.floor(baseSeed)) || 7919);
+  for (let i = 0; i < count; i++) {
+    state = (state * 1664525 + 1013904223) % 2147483647;
+    seeds.push(Math.abs(state));
+  }
+  return seeds;
+}
+
+function normalizePlayerIdTag(id: string): string {
+  const trimmed = (id || '').trim().toLowerCase();
+  if (!trimmed) return '';
+  return trimmed.startsWith('#') ? trimmed : `#${trimmed}`;
+}
+
 export async function createCloudPrivateRoom(
   roomCode: string,
   hostAccount: PlayerAccount,
   category: string,
-  questionSeed: number
+  questionSeed: number,
+  targetPlayerId = '',
+  customQuestionSeeds?: number[]
 ): Promise<boolean> {
   if (typeof navigator !== 'undefined' && !navigator.onLine) return false;
   const hostUid = getSafeDocUid(hostAccount);
   const path = `rooms/${roomCode}`;
+  const cleanTargetId = normalizePlayerIdTag(targetPlayerId).slice(0, 32);
+  const unifiedSeeds = (
+    customQuestionSeeds && customQuestionSeeds.length > 0
+      ? customQuestionSeeds
+      : generateRoomQuestionSeeds(questionSeed, 25)
+  )
+    .slice(0, 25)
+    .map(n => Math.max(0, Math.floor(Number(n) || 0)));
+
   try {
     await syncPlayerToCloud(hostAccount);
     await setDoc(doc(db, 'rooms', roomCode), {
@@ -389,14 +455,20 @@ export async function createCloudPrivateRoom(
       hostUid,
       hostName: hostAccount.username.slice(0, 32),
       hostFlag: hostAccount.countryFlag.slice(0, 16),
+      hostPlayerId: (hostAccount.playerId || '').slice(0, 16),
       guestUid: '',
       guestName: '',
       guestFlag: '',
+      guestPlayerId: '',
+      targetPlayerId: cleanTargetId,
       category: category.slice(0, 32),
-      questionSeed: Math.floor(questionSeed),
+      questionSeed: Math.max(0, Math.floor(questionSeed)),
+      questionSeeds: unifiedSeeds,
       status: 'waiting',
       hostScore: 0,
       guestScore: 0,
+      hostAnsweredRound: 0,
+      guestAnsweredRound: 0,
       hostReadyNextRound: false,
       guestReadyNextRound: false,
       createdAt: serverTimestamp(),
@@ -415,33 +487,57 @@ export async function joinCloudPrivateRoom(
 ): Promise<{
   category: string;
   questionSeed: number;
+  questionSeeds: number[];
   hostName: string;
   hostFlag: string;
   hostUid: string;
+  hostPlayerId: string;
+  status: string;
 } | null> {
   if (typeof navigator !== 'undefined' && !navigator.onLine) return null;
-  const guestUid = getSafeDocUid(guestAccount);
+  const rawGuestUid = getSafeDocUid(guestAccount);
   const path = `rooms/${roomCode}`;
   try {
     await syncPlayerToCloud(guestAccount);
     const snap = await getDoc(doc(db, 'rooms', roomCode));
     if (!snap.exists()) return null;
     const data = snap.data();
-    if (data.status === 'waiting' && data.hostUid !== guestUid) {
+
+    const isHostRejoiningOwnWaitingRoom =
+      data.hostUid === rawGuestUid &&
+      (data.hostPlayerId || '') === (guestAccount.playerId || '') &&
+      data.hostName === guestAccount.username;
+
+    if (data.status === 'waiting' && !isHostRejoiningOwnWaitingRoom) {
+      const effectiveGuestUid =
+        data.hostUid === rawGuestUid
+          ? `${rawGuestUid}_guest_${guestAccount.playerId.replace(/[^0-9]/g, '').slice(-4) || '2'}`.slice(
+              0,
+              120
+            )
+          : rawGuestUid;
+
       await updateDoc(doc(db, 'rooms', roomCode), {
-        guestUid,
+        guestUid: effectiveGuestUid,
         guestName: guestAccount.username.slice(0, 32),
         guestFlag: guestAccount.countryFlag.slice(0, 16),
+        guestPlayerId: (guestAccount.playerId || '').slice(0, 16),
         status: 'active',
         updatedAt: serverTimestamp(),
       });
     }
+
     return {
-      category: data.category,
-      questionSeed: data.questionSeed,
-      hostName: data.hostName,
-      hostFlag: data.hostFlag,
-      hostUid: data.hostUid,
+      category: String(data.category || 'cocktail'),
+      questionSeed: Number(data.questionSeed || 7),
+      questionSeeds: Array.isArray(data.questionSeeds)
+        ? data.questionSeeds.map((n: unknown) => Number(n) || 0)
+        : generateRoomQuestionSeeds(Number(data.questionSeed || 7), 25),
+      hostName: String(data.hostName || 'المضيف'),
+      hostFlag: String(data.hostFlag || '🇸🇦'),
+      hostUid: String(data.hostUid || ''),
+      hostPlayerId: String(data.hostPlayerId || ''),
+      status: isHostRejoiningOwnWaitingRoom ? String(data.status || 'waiting') : 'active',
     };
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, path);
@@ -454,9 +550,11 @@ export async function updateCloudRoomState(
   updates: Partial<{
     hostScore: number;
     guestScore: number;
+    hostAnsweredRound: number;
+    guestAnsweredRound: number;
     hostReadyNextRound: boolean;
     guestReadyNextRound: boolean;
-    status: 'waiting' | 'active' | 'completed';
+    status: 'waiting' | 'active' | 'finished' | 'completed';
   }>
 ): Promise<void> {
   if (typeof navigator !== 'undefined' && !navigator.onLine) return;
@@ -492,8 +590,9 @@ export function subscribeToCloudRoom(
 
 /**
  * Real-time listener for newly opened challenge rooms in Firestore (`rooms` with status === 'waiting')
- * so the player receives a Local Notification when a friend or new challenger invites them,
- * even if the app tab is in the background.
+ * across different mobile devices via Cloud Firestore.
+ * Immediately notifies the second device when `targetPlayerId === myAccount.playerId`
+ * (or when an open waiting room is created).
  */
 export function subscribeToIncomingCloudChallenges(
   myAccount: PlayerAccount,
@@ -502,50 +601,109 @@ export function subscribeToIncomingCloudChallenges(
     hostUid: string,
     hostName: string,
     hostFlag: string,
-    category: string
+    category: string,
+    hostPlayerId?: string,
+    targetPlayerId?: string
   ) => void
 ): Unsubscribe {
   if (typeof navigator !== 'undefined' && !navigator.onLine) {
     return () => {};
   }
   const mySafeUid = getSafeDocUid(myAccount);
+  const myNormalizedId = normalizePlayerIdTag(myAccount.playerId);
   const path = 'rooms';
   const seenRoomCodes = new Set<string>();
   let isInitialSnapshot = true;
 
   const q = query(collection(db, 'rooms'), where('status', '==', 'waiting'));
 
+  const processRoomDoc = (
+    docId: string,
+    data: Record<string, any>,
+    isFromInitial: boolean
+  ) => {
+    const roomCode = String(data.roomCode || docId);
+    const hostUid = String(data.hostUid || '');
+    const hostName = String(data.hostName || 'منافس جديد');
+    const hostFlag = String(data.hostFlag || '🇸🇦');
+    const hostPlayerId = String(data.hostPlayerId || '');
+    const targetPlayerId = normalizePlayerIdTag(String(data.targetPlayerId || ''));
+    const category = String(data.category || 'cocktail');
+
+    // Never notify the host about their own room
+    if (
+      hostUid === mySafeUid ||
+      (hostPlayerId && normalizePlayerIdTag(hostPlayerId) === myNormalizedId) ||
+      hostName.toLowerCase() === myAccount.username.toLowerCase()
+    ) {
+      seenRoomCodes.add(roomCode);
+      return;
+    }
+
+    // If this room targets a specific player ID, ONLY notify that exact target player
+    if (targetPlayerId && targetPlayerId !== myNormalizedId) {
+      seenRoomCodes.add(roomCode);
+      return;
+    }
+
+    // On initial snapshot, only trigger if this room is specifically targeting this player
+    // and was created within the last 5 minutes so stale old rooms don't pop up
+    if (isFromInitial) {
+      const rawCreated = data.createdAt || data.updatedAt;
+      const createdMs =
+        rawCreated && typeof rawCreated.toMillis === 'function'
+          ? rawCreated.toMillis()
+          : Date.now();
+      const isRecentTargetedInvite =
+        targetPlayerId === myNormalizedId &&
+        Date.now() - createdMs <= 5 * 60 * 1000;
+
+      seenRoomCodes.add(roomCode);
+      if (isRecentTargetedInvite) {
+        onNewChallenge(
+          roomCode,
+          hostUid,
+          hostName,
+          hostFlag,
+          category,
+          hostPlayerId,
+          targetPlayerId
+        );
+      }
+      return;
+    }
+
+    if (seenRoomCodes.has(roomCode)) return;
+    seenRoomCodes.add(roomCode);
+
+    onNewChallenge(
+      roomCode,
+      hostUid,
+      hostName,
+      hostFlag,
+      category,
+      hostPlayerId,
+      targetPlayerId
+    );
+  };
+
   return onSnapshot(
     q,
     snap => {
       if (isInitialSnapshot) {
-        snap.docs.forEach(d => {
-          seenRoomCodes.add(d.id);
-        });
         isInitialSnapshot = false;
+        snap.docs.forEach(d => {
+          processRoomDoc(d.id, d.data(), true);
+        });
         return;
       }
 
       snap.docChanges().forEach(change => {
-        if (change.type === 'added') {
+        if (change.type === 'added' || change.type === 'modified') {
           const data = change.doc.data();
-          const roomCode = String(data.roomCode || change.doc.id);
-          const hostUid = String(data.hostUid || '');
-          const hostName = String(data.hostName || 'منافس جديد');
-          const hostFlag = String(data.hostFlag || '🇸🇦');
-          const category = String(data.category || 'cocktail');
-
-          if (seenRoomCodes.has(roomCode)) return;
-          seenRoomCodes.add(roomCode);
-
-          if (
-            hostUid === mySafeUid ||
-            hostName.toLowerCase() === myAccount.username.toLowerCase()
-          ) {
-            return;
+          if (data.status === 'waiting') {
+            processRoomDoc(change.doc.id, data, false);
           }
-
-          onNewChallenge(roomCode, hostUid, hostName, hostFlag, category);
         }
       });
     },
@@ -746,11 +904,12 @@ export function subscribeToFriendsPresence(
 /**
  * Sends a direct Quick Challenge Invite to a friend via Firestore without needing
  * manual room code generation. Automatically provisions a synchronized room document
- * in Firestore and returns its roomCode and category.
+ * in Firestore with `targetPlayerId` and `status: 'waiting'`, and returns its roomCode and category.
  */
 export async function sendQuickChallengeInvite(
   senderAccount: PlayerAccount,
-  category = 'cocktail'
+  category = 'cocktail',
+  targetPlayerId = ''
 ): Promise<{ roomCode: string; category: string } | null> {
   const roomCode = Math.floor(1000 + Math.random() * 9000).toString();
   const seed = roomCode
@@ -761,7 +920,8 @@ export async function sendQuickChallengeInvite(
     roomCode,
     senderAccount,
     category,
-    seed
+    seed,
+    targetPlayerId
   );
   if (!ok) {
     return { roomCode, category };
@@ -1153,3 +1313,76 @@ export async function ownerMutatePlayerInFirestore(
 
   return updated;
 }
+
+/**
+ * Listens in real time to the current player's document in Firestore (`users/{uid}`)
+ * so any 1-click VIP activation, coin grant, or fair-play/ban update from the Owner Control Panel
+ * reflects immediately in the player's client.
+ */
+export function subscribeToMyCloudProfileUpdates(
+  account: PlayerAccount,
+  onRemotePatch: (patch: Partial<PlayerAccount>) => void
+): Unsubscribe {
+  if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    return () => {};
+  }
+  const docId = getSafeDocUid(account);
+  const path = `users/${docId}`;
+  let isFirstSnap = true;
+
+  return onSnapshot(
+    doc(db, 'users', docId),
+    snap => {
+      if (!snap.exists()) return;
+      if (isFirstSnap) {
+        isFirstSnap = false;
+        return;
+      }
+      const data = snap.data();
+      const patch: Partial<PlayerAccount> = {};
+      let hasChanges = false;
+
+      if (data.vipTier && data.vipTier !== account.vipTier) {
+        patch.vipTier = data.vipTier;
+        hasChanges = true;
+      }
+      if (typeof data.coins === 'number' && data.coins !== account.coins) {
+        patch.coins = data.coins;
+        hasChanges = true;
+      }
+      if (
+        typeof data.monthlyPoints === 'number' &&
+        data.monthlyPoints !== account.monthlyPoints
+      ) {
+        patch.monthlyPoints = data.monthlyPoints;
+        hasChanges = true;
+      }
+      if (typeof data.rating === 'number' && data.rating !== account.rating) {
+        patch.rating = data.rating;
+        hasChanges = true;
+      }
+      if (
+        typeof data.fairPlayScore === 'number' &&
+        data.fairPlayScore !== account.fairPlayScore
+      ) {
+        patch.fairPlayScore = data.fairPlayScore;
+        hasChanges = true;
+      }
+      if (
+        typeof data.isBanned === 'boolean' &&
+        data.isBanned !== Boolean(account.isBanned)
+      ) {
+        patch.isBanned = data.isBanned;
+        hasChanges = true;
+      }
+
+      if (hasChanges) {
+        onRemotePatch(patch);
+      }
+    },
+    err => {
+      handleFirestoreError(err, OperationType.GET, path);
+    }
+  );
+}
+

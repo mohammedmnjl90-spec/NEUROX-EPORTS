@@ -536,14 +536,31 @@ export function getMatchQuestions(
   category: CategoryId,
   count: number,
   seenIds: string[],
-  customSeed?: number
+  customSeed?: number,
+  questionSeeds?: number[]
 ): QuizQuestion[] {
-  const rand = customSeed !== undefined ? createSeededRandom(customSeed) : Math.random;
-
   let pool =
     category === 'cocktail'
       ? [...FULL_QUESTION_BANK]
       : FULL_QUESTION_BANK.filter(q => q.category === category);
+
+  // If unified questionSeeds array is provided from Firestore room document,
+  // deterministically pick the exact non-repeating questions and option order on both devices
+  if (Array.isArray(questionSeeds) && questionSeeds.length > 0 && pool.length > 0) {
+    const remaining = [...pool];
+    const selected: QuizQuestion[] = [];
+    for (let i = 0; i < count; i++) {
+      if (remaining.length === 0) break;
+      const seedVal = Math.abs(Math.floor(questionSeeds[i % questionSeeds.length] || i + 1));
+      const pickIndex = seedVal % remaining.length;
+      const picked = remaining.splice(pickIndex, 1)[0];
+      const optRand = createSeededRandom(seedVal + i * 97 + 13);
+      selected.push(shuffleQuestionOptions(picked, optRand));
+    }
+    return selected;
+  }
+
+  const rand = customSeed !== undefined ? createSeededRandom(customSeed) : Math.random;
 
   // If NOT using a deterministic shared room seed, filter out recently seen questions first
   if (customSeed === undefined && seenIds.length > 0) {

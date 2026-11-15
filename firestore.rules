@@ -73,29 +73,37 @@ service cloud.firestore {
       return data.keys().hasAll([
         'roomCode', 'hostUid', 'hostName', 'hostFlag',
         'guestUid', 'guestName', 'guestFlag',
-        'category', 'questionSeed', 'status',
-        'hostScore', 'guestScore', 'hostReadyNextRound', 'guestReadyNextRound',
+        'targetPlayerId', 'category', 'questionSeed', 'questionSeeds', 'status',
+        'hostScore', 'guestScore', 'hostAnsweredRound', 'guestAnsweredRound',
+        'hostReadyNextRound', 'guestReadyNextRound',
         'createdAt', 'updatedAt'
       ]) &&
       data.keys().hasOnly([
-        'roomCode', 'hostUid', 'hostName', 'hostFlag',
-        'guestUid', 'guestName', 'guestFlag',
-        'category', 'questionSeed', 'status',
-        'hostScore', 'guestScore', 'hostReadyNextRound', 'guestReadyNextRound',
+        'roomCode', 'hostUid', 'hostName', 'hostFlag', 'hostPlayerId',
+        'guestUid', 'guestName', 'guestFlag', 'guestPlayerId',
+        'targetPlayerId', 'category', 'questionSeed', 'questionSeeds', 'status',
+        'hostScore', 'guestScore', 'hostAnsweredRound', 'guestAnsweredRound',
+        'hostReadyNextRound', 'guestReadyNextRound',
         'createdAt', 'updatedAt'
       ]) &&
       data.roomCode is string && data.roomCode.size() >= 4 && data.roomCode.size() <= 16 && data.roomCode.matches('^[a-zA-Z0-9_\\-]+$') &&
       data.hostUid is string && data.hostUid.size() >= 1 && data.hostUid.size() <= 128 && data.hostUid.matches('^[a-zA-Z0-9_\\-]+$') &&
       data.hostName is string && data.hostName.size() >= 1 && data.hostName.size() <= 32 &&
       data.hostFlag is string && data.hostFlag.size() >= 1 && data.hostFlag.size() <= 16 &&
+      (!('hostPlayerId' in data) || (data.hostPlayerId is string && data.hostPlayerId.size() <= 16)) &&
       data.guestUid is string && data.guestUid.size() <= 128 &&
       data.guestName is string && data.guestName.size() <= 32 &&
       data.guestFlag is string && data.guestFlag.size() <= 16 &&
+      (!('guestPlayerId' in data) || (data.guestPlayerId is string && data.guestPlayerId.size() <= 16)) &&
+      data.targetPlayerId is string && data.targetPlayerId.size() <= 32 &&
       data.category is string && data.category.size() >= 1 && data.category.size() <= 32 &&
       data.questionSeed is int && data.questionSeed >= 0 &&
-      data.status is string && data.status in ['waiting', 'active', 'completed'] &&
-      data.hostScore is int && data.hostScore >= 0 && data.hostScore <= 100 &&
-      data.guestScore is int && data.guestScore >= 0 && data.guestScore <= 100 &&
+      data.questionSeeds is list && data.questionSeeds.size() >= 1 && data.questionSeeds.size() <= 30 &&
+      data.status is string && data.status in ['waiting', 'active', 'finished', 'completed'] &&
+      data.hostScore is int && data.hostScore >= 0 && data.hostScore <= 500 &&
+      data.guestScore is int && data.guestScore >= 0 && data.guestScore <= 500 &&
+      data.hostAnsweredRound is int && data.hostAnsweredRound >= 0 && data.hostAnsweredRound <= 100 &&
+      data.guestAnsweredRound is int && data.guestAnsweredRound >= 0 && data.guestAnsweredRound <= 100 &&
       data.hostReadyNextRound is bool &&
       data.guestReadyNextRound is bool &&
       data.createdAt is timestamp &&
@@ -188,7 +196,7 @@ service cloud.firestore {
 
     match /rooms/{roomId} {
       allow get: if isValidId(roomId);
-      allow list: if resource.data.status in ['waiting', 'active'];
+      allow list: if resource.data.status in ['waiting', 'active', 'finished', 'completed'];
 
       allow create: if isValidId(roomId) &&
         isValidPrivateRoom(incoming()) &&
@@ -200,7 +208,7 @@ service cloud.firestore {
 
       allow update: if isValidId(roomId) &&
         isValidPrivateRoom(incoming()) &&
-        existing().status != 'completed' &&
+        !(existing().status in ['completed', 'finished']) &&
         incoming().roomCode == existing().roomCode &&
         incoming().hostUid == existing().hostUid &&
         incoming().hostName == existing().hostName &&
@@ -212,17 +220,21 @@ service cloud.firestore {
           // Action 1: Guest Joins Waiting Room
           (
             existing().status == 'waiting' &&
-            existing().guestUid == '' &&
             incoming().status == 'active' &&
-            incoming().diff(existing()).affectedKeys().hasOnly(['guestUid', 'guestName', 'guestFlag', 'status', 'updatedAt'])
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'guestUid', 'guestName', 'guestFlag', 'guestPlayerId', 'status', 'updatedAt'
+            ])
           ) ||
-          // Action 2: Host or Guest Updates Score / Round Readiness / Completion
+          // Action 2: Host or Guest Updates Score / Answered Round / Readiness / Finished
           (
             incoming().guestUid == existing().guestUid &&
             incoming().guestName == existing().guestName &&
             incoming().guestFlag == existing().guestFlag &&
             incoming().diff(existing()).affectedKeys().hasOnly([
-              'hostScore', 'guestScore', 'hostReadyNextRound', 'guestReadyNextRound', 'status', 'updatedAt'
+              'hostScore', 'guestScore',
+              'hostAnsweredRound', 'guestAnsweredRound',
+              'hostReadyNextRound', 'guestReadyNextRound',
+              'status', 'updatedAt'
             ])
           )
         );

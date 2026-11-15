@@ -190,9 +190,54 @@ export interface PlayerAccount {
   equippedBorder?: ProfileBorderId;
   ownedThemes?: UiThemeId[];
   equippedTheme?: UiThemeId;
+  playtimeSeconds?: number; // Cumulative hourly playtime counter (0..3600)
   isBanned?: boolean;
   createdAt: number;
   updatedAt: number;
+}
+
+export interface HourlyAdConfig {
+  enabled: boolean;
+  intervalSeconds: number; // 3600 seconds (60 minutes)
+  countdownSeconds: number; // e.g. 5..15 seconds
+  adTitle: string;
+  adDescription: string;
+  bannerImageUrl: string;
+  videoUrl: string;
+  targetLinkUrl: string;
+  ctaButtonText: string;
+  stripeBronzeUrl: string;
+  stripeSilverUrl: string;
+  stripeGoldUrl: string;
+  paypalCheckoutUrl: string;
+  ownerContactInfo: string;
+  updatedAt: number;
+}
+
+export interface PromoVipCode {
+  code: string;
+  rewardType: 'vip' | 'coins';
+  vipTier?: VipTier;
+  bonusCoins: number;
+  maxUses: number;
+  usedByPlayerIds: string[];
+  noteAr: string;
+  createdAt: number;
+}
+
+export interface VipPaymentRequest {
+  id: string;
+  uid: string;
+  playerId: string;
+  username: string;
+  countryFlag: string;
+  requestedTier: VipTier;
+  priceUsdText: string;
+  paymentMethod: 'card' | 'paypal' | 'local_transfer';
+  transferReference: string;
+  status: 'pending' | 'approved' | 'rejected';
+  createdAt: number;
+  processedAt?: number;
 }
 
 export interface CloudManagedPlayer {
@@ -224,3 +269,4 @@ export interface QuizQuestion {
   correctIndex: number; // 0..3
   difficulty: 'easy' | 'medium' | 'hard';
 }
+

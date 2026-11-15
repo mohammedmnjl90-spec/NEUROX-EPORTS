@@ -149,6 +149,18 @@
           "type": "string",
           "maxLength": 16
         },
+        "hostPlayerId": {
+          "type": "string",
+          "maxLength": 16
+        },
+        "guestPlayerId": {
+          "type": "string",
+          "maxLength": 16
+        },
+        "targetPlayerId": {
+          "type": "string",
+          "maxLength": 32
+        },
         "category": {
           "type": "string",
           "maxLength": 32
@@ -156,14 +168,26 @@
         "questionSeed": {
           "type": "number"
         },
+        "questionSeeds": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          }
+        },
         "status": {
           "type": "string",
-          "enum": ["waiting", "active", "completed"]
+          "enum": ["waiting", "active", "finished", "completed"]
         },
         "hostScore": {
           "type": "number"
         },
         "guestScore": {
+          "type": "number"
+        },
+        "hostAnsweredRound": {
+          "type": "number"
+        },
+        "guestAnsweredRound": {
           "type": "number"
         },
         "hostReadyNextRound": {
@@ -189,11 +213,15 @@
         "guestUid",
         "guestName",
         "guestFlag",
+        "targetPlayerId",
         "category",
         "questionSeed",
+        "questionSeeds",
         "status",
         "hostScore",
         "guestScore",
+        "hostAnsweredRound",
+        "guestAnsweredRound",
         "hostReadyNextRound",
         "guestReadyNextRound",
         "createdAt",
