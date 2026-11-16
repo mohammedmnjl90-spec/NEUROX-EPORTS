@@ -22,6 +22,8 @@ import {
   getDocs,
   onSnapshot,
   serverTimestamp,
+  enableNetwork,
+  disableNetwork,
   Unsubscribe,
 } from 'firebase/firestore';
 import appletFirebaseConfig from '../../firebase-applet-config.json';
@@ -136,7 +138,7 @@ export function handleFirestoreError(
   throw new Error(JSON.stringify(errInfo));
 }
 
-// Validate connection on boot when online
+// Validate connection on boot only when online
 async function testConnection() {
   if (typeof navigator !== 'undefined' && !navigator.onLine) return;
   try {
@@ -148,39 +150,249 @@ async function testConnection() {
 testConnection();
 
 /**
- * Active real-world internet + Firestore reachability heartbeat check (called every 4 seconds).
- * Does not rely solely on `navigator.onLine`; performs a live network fetch probe with a short
- * timeout so disconnecting Wi-Fi/data or losing real internet access is detected immediately.
+ * Toggles Firestore network transport cleanly when browser/Android network state changes.
  */
-export async function checkRealInternetAndFirebaseConnection(): Promise<boolean> {
-  if (typeof navigator !== 'undefined' && !navigator.onLine) {
-    return false;
-  }
-  if (typeof window === 'undefined') {
-    return true;
-  }
-
-  const controller = new AbortController();
-  const timeoutId = window.setTimeout(() => controller.abort(), 3000);
-
+export function setFirestoreOnlineMode(online: boolean): void {
   try {
-    const res = await fetch(
-      `${window.location.origin}/?neurox_hb=${Date.now()}`,
-      {
-        method: 'HEAD',
-        cache: 'no-store',
-        signal: controller.signal,
-      }
-    );
-    window.clearTimeout(timeoutId);
-    if (!res.ok && res.status !== 304) {
-      return false;
+    if (online) {
+      enableNetwork(db).catch(() => {});
+    } else {
+      disableNetwork(db).catch(() => {});
     }
-    return true;
   } catch {
-    window.clearTimeout(timeoutId);
+    // Ignore transport toggle errors
+  }
+}
+
+function runWithTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number
+): Promise<{ ok: true; value: T } | { ok: false; timedOut: boolean; error?: unknown }> {
+  return new Promise(resolve => {
+    let settled = false;
+    const timer = window.setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve({ ok: false, timedOut: true });
+    }, timeoutMs);
+
+    promise
+      .then(value => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        resolve({ ok: true, value });
+      })
+      .catch(error => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        resolve({ ok: false, timedOut: false, error });
+      });
+  });
+}
+
+/**
+ * Lightweight Firestore connectivity check without any external `fetch` calls
+ * (prevents Android WebView / Capacitor APK from hanging on blocked HTTP origin probes).
+ * Relies solely on `navigator.onLine` + lightweight `getDocFromServer` on an allowed read path.
+ */
+export async function checkRealInternetAndFirebaseConnection(
+  timeoutMs = 4000
+): Promise<boolean> {
+  if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    setFirestoreOnlineMode(false);
     return false;
   }
+
+  setFirestoreOnlineMode(true);
+
+  const probe = await runWithTimeout(
+    getDocFromServer(doc(db, 'players', 'neurox_ping_check')),
+    timeoutMs
+  );
+
+  if (probe.ok) {
+    return true;
+  }
+  if (probe.timedOut) {
+    return false;
+  }
+  // If Firestore server responded with a non-network error (e.g., permission-denied), server is reachable
+  return !isOfflineOrNetworkError(probe.error);
+}
+
+export interface CloudStartupResult {
+  online: boolean;
+  cloudSynced: boolean;
+  timedOut: boolean;
+  accountPatch?: Partial<PlayerAccount>;
+}
+
+/**
+ * Real Firebase startup sync for SplashScreen.tsx:
+ * - If offline (`!navigator.onLine`): skips server immediately for instant local launch.
+ * - If online: enables Firestore network, reads/syncs player profile & active waiting rooms
+ *   at the user's real internet speed, capped by a 12-second safety timeout so the app never hangs.
+ */
+export async function bootstrapCloudStartup(
+  existingAccount: PlayerAccount | null,
+  maxTimeoutMs = 12000,
+  onStage?: (stage: 'connecting' | 'syncing' | 'done') => void
+): Promise<CloudStartupResult> {
+  if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    setFirestoreOnlineMode(false);
+    return {
+      online: false,
+      cloudSynced: false,
+      timedOut: false,
+    };
+  }
+
+  setFirestoreOnlineMode(true);
+  onStage?.('connecting');
+
+  const syncWork = async (): Promise<{
+    reachable: boolean;
+    synced: boolean;
+    accountPatch?: Partial<PlayerAccount>;
+  }> => {
+    let reachable = false;
+    let synced = false;
+    let accountPatch: Partial<PlayerAccount> | undefined;
+
+    // Step 1: Verify real Firestore server response using lightweight getDocFromServer
+    if (existingAccount) {
+      const safeUid = getSafeDocUid(existingAccount);
+      try {
+        const serverUserSnap = await getDocFromServer(doc(db, 'users', safeUid));
+        reachable = true;
+        if (serverUserSnap.exists()) {
+          const d = serverUserSnap.data();
+          const patch: Partial<PlayerAccount> = {};
+          if (d.vipTier && d.vipTier !== existingAccount.vipTier) {
+            patch.vipTier = d.vipTier;
+          }
+          if (typeof d.coins === 'number' && d.coins !== existingAccount.coins) {
+            patch.coins = d.coins;
+          }
+          if (
+            typeof d.monthlyPoints === 'number' &&
+            d.monthlyPoints !== existingAccount.monthlyPoints
+          ) {
+            patch.monthlyPoints = d.monthlyPoints;
+          }
+          if (typeof d.rating === 'number' && d.rating !== existingAccount.rating) {
+            patch.rating = d.rating;
+          }
+          if (
+            typeof d.fairPlayScore === 'number' &&
+            d.fairPlayScore !== existingAccount.fairPlayScore
+          ) {
+            patch.fairPlayScore = d.fairPlayScore;
+          }
+          if (
+            typeof d.isBanned === 'boolean' &&
+            d.isBanned !== Boolean(existingAccount.isBanned)
+          ) {
+            patch.isBanned = d.isBanned;
+          }
+          if (Object.keys(patch).length > 0) {
+            accountPatch = patch;
+          }
+        }
+      } catch (err) {
+        if (!isOfflineOrNetworkError(err)) {
+          reachable = true;
+        }
+      }
+
+      onStage?.('syncing');
+
+      // Step 2: Sync local account & warm active rooms snapshot in parallel
+      const [profileSyncOk] = await Promise.all([
+        syncPlayerToCloud(
+          accountPatch ? { ...existingAccount, ...accountPatch } : existingAccount
+        ).catch(() => false),
+        getDocs(
+          query(collection(db, 'rooms'), where('status', '==', 'waiting'), limit(5))
+        ).catch(() => null),
+      ]);
+
+      if (profileSyncOk) {
+        reachable = true;
+        synced = true;
+      }
+    } else {
+      // No logged-in account yet: lightweight server ping + leaderboard warmup
+      try {
+        await getDocFromServer(doc(db, 'players', 'neurox_ping_check'));
+        reachable = true;
+      } catch (err) {
+        if (!isOfflineOrNetworkError(err)) {
+          reachable = true;
+        }
+      }
+
+      onStage?.('syncing');
+
+      try {
+        await getDocs(
+          query(
+            collection(db, 'players'),
+            where('monthlyPoints', '>=', 0),
+            orderBy('monthlyPoints', 'desc'),
+            limit(5)
+          )
+        );
+        reachable = true;
+        synced = true;
+      } catch {
+        // Ignore query error if offline
+      }
+    }
+
+    return { reachable, synced, accountPatch };
+  };
+
+  const result = await runWithTimeout(syncWork(), maxTimeoutMs);
+  onStage?.('done');
+
+  if (!result.ok) {
+    return {
+      online: false,
+      cloudSynced: false,
+      timedOut: result.timedOut,
+    };
+  }
+
+  return {
+    online: result.value.reachable,
+    cloudSynced: result.value.synced,
+    timedOut: false,
+    accountPatch: result.value.accountPatch,
+  };
+}
+
+/**
+ * Syncs newly registered or logged-in account to Firestore during AuthScreen flow
+ * with a hard 12-second safety timeout so AuthScreen never hangs on poor mobile networks.
+ */
+export async function syncAuthAccountWithCloud(
+  account: PlayerAccount,
+  maxTimeoutMs = 12000
+): Promise<{ synced: boolean; timedOut: boolean }> {
+  if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    setFirestoreOnlineMode(false);
+    return { synced: false, timedOut: false };
+  }
+
+  setFirestoreOnlineMode(true);
+  const res = await runWithTimeout(syncPlayerToCloud(account), maxTimeoutMs);
+  if (!res.ok) {
+    return { synced: false, timedOut: res.timedOut };
+  }
+  return { synced: Boolean(res.value), timedOut: false };
 }
 
 export async function linkGoogleCloudAccount(): Promise<User | null> {

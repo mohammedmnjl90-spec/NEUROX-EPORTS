@@ -256,9 +256,13 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
       const guestName = String(data.guestName || '');
       const guestFlag = String(data.guestFlag || '🇸🇦');
       const guestPlayerId = String(data.guestPlayerId || '');
-      const status = String(data.status || 'waiting') as 'waiting' | 'active' | 'finished';
+      const status = String(data.status || 'waiting') as
+        | 'waiting'
+        | 'active'
+        | 'finished'
+        | 'completed';
 
-      setRoomCloudStatus(status);
+      setRoomCloudStatus(status === 'completed' ? 'finished' : status);
 
       // Determine whether this device is the Host or the Guest
       const isHost =
@@ -503,7 +507,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
     }
 
     const botTimer = setTimeout(() => {
-      if (isAnswerLocked || mode === 'room') return;
+      if (isAnswerLocked) return;
       const willAnswerCorrectly = Math.random() < accuracy;
       let chosenIdx = currentQuestion.correctIndex;
       if (!willAnswerCorrectly) {

@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   computeLevelInfo,
   LANGUAGE_LABELS,
@@ -19,8 +19,10 @@ import {
   updatePlayerProfileIdentity,
 } from './services/storage';
 import {
+  checkRealInternetAndFirebaseConnection,
   createCloudPrivateRoom,
   joinCloudPrivateRoom,
+  setFirestoreOnlineMode,
   subscribeToIncomingCloudChallenges,
   subscribeToMyCloudProfileUpdates,
 } from './services/firebase';
@@ -246,6 +248,12 @@ export default function App() {
     customOpponentFlag?: string;
     customOpponentPlayerId?: string;
   } | null>(null);
+  const activeMatchRef = useRef(activeMatch);
+  activeMatchRef.current = activeMatch;
+  const isOnlineRef = useRef(isOnline);
+  isOnlineRef.current = isOnline;
+  const showSplashRef = useRef(showSplash);
+  showSplashRef.current = showSplash;
 
   // 4-Digit Private Room Modal State
   const [roomModalOpen, setRoomModalOpen] = useState<boolean>(false);
@@ -391,7 +399,7 @@ export default function App() {
     if (account) {
       savePlaytimeSeconds(account.uid, 0);
     }
-    if (goToVipStore) {
+    if (goToVipStore && isOnlineRef.current) {
       setActiveMatch(null);
       setActiveTab('store');
     }
@@ -408,16 +416,15 @@ export default function App() {
     return () => window.removeEventListener('popstate', handlePopState);
   }, []);
 
-  // Monitor Internet Connectivity: When offline, lock all online modes/tabs and keep only offline modes open
+  // Monitor Internet Connectivity via navigator.onLine events + lightweight Firestore reachability probe:
+  // When offline, immediately disable Firestore network, terminate any active online/room match,
+  // lock all online modes/tabs ('online', 'room', 'friends', 'store', 'leaderboard'),
+  // and keep only offline modes ('solo' & 'local') open.
   useEffect(() => {
-    const handleOnline = () => {
-      setIsOnline(true);
-      setSelectedMode('online');
-      showToast(
-        '🌐 عاد الاتصال بالإنترنت! تم فتح جميع أطوار الأونلاين والأصدقاء والبطولة السحابية.'
-      );
-    };
-    const handleOffline = () => {
+    const applyOfflineLockdown = () => {
+      setFirestoreOnlineMode(false);
+      const wasOnline = isOnlineRef.current;
+      isOnlineRef.current = false;
       setIsOnline(false);
       setSelectedMode(prev => (prev === 'online' || prev === 'room' ? 'solo' : prev));
       setActiveTab(prev =>
@@ -426,16 +433,76 @@ export default function App() {
           : prev
       );
       setRoomModalOpen(false);
-      showToast(
-        '📡 لا يوجد اتصال بالإنترنت: تم تفعيل وضع الأوفلاين فقط (الفردي والمحلي) وإيقاف الأونلاين مؤقتاً.'
-      );
+      setActiveIncomingBanner(null);
+
+      const runningMatch = activeMatchRef.current;
+      if (
+        runningMatch &&
+        (runningMatch.mode === 'online' || runningMatch.mode === 'room')
+      ) {
+        soundFX.playWrong();
+        setActiveMatch(null);
+        setActiveTab('arena');
+        showToast(
+          '📡 انقطع الاتصال بالإنترنت! تم إنهاء المباراة الأونلاين فوراً وإرجاعك للساحة الرئيسية مع قفل أطوار الشبكة.'
+        );
+      } else if (wasOnline && !showSplashRef.current) {
+        showToast(
+          '📡 لا يوجد اتصال بالإنترنت: تم تفعيل وضع الأوفلاين فقط (الفردي والمحلي) وإيقاف الأونلاين مؤقتاً.'
+        );
+      }
     };
 
-    window.addEventListener('online', handleOnline);
-    window.addEventListener('offline', handleOffline);
+    const applyOnlineRecovery = () => {
+      setFirestoreOnlineMode(true);
+      if (isOnlineRef.current) return;
+      isOnlineRef.current = true;
+      setIsOnline(true);
+      setSelectedMode('online');
+      if (!showSplashRef.current) {
+        showToast(
+          '🌐 عاد الاتصال بالإنترنت! تم فتح جميع أطوار الأونلاين والأصدقاء والبطولة السحابية.'
+        );
+      }
+    };
+
+    const runHeartbeat = async () => {
+      if (showSplashRef.current) return;
+      if (typeof navigator !== 'undefined' && !navigator.onLine) {
+        applyOfflineLockdown();
+        return;
+      }
+      const reachable = await checkRealInternetAndFirebaseConnection(4000);
+      if (!reachable) {
+        applyOfflineLockdown();
+      } else if (!isOnlineRef.current) {
+        applyOnlineRecovery();
+      }
+    };
+
+    const handleBrowserOnline = () => {
+      setFirestoreOnlineMode(true);
+      if (showSplashRef.current) {
+        isOnlineRef.current = true;
+        setIsOnline(true);
+      } else {
+        runHeartbeat();
+      }
+    };
+
+    window.addEventListener('online', handleBrowserOnline);
+    window.addEventListener('offline', applyOfflineLockdown);
+
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      applyOfflineLockdown();
+    }
+
+    const hbInterval = window.setInterval(runHeartbeat, 6000);
+
     return () => {
-      window.removeEventListener('online', handleOnline);
-      window.removeEventListener('offline', handleOffline);
+      window.removeEventListener('online', handleBrowserOnline);
+      window.removeEventListener('offline', applyOfflineLockdown);
+      window.clearInterval(hbInterval);
     };
   }, []);
 
@@ -554,6 +621,10 @@ export default function App() {
     const cloudRoom = await joinCloudPrivateRoom(clean, account).catch(
       () => null
     );
+    const isJoiningAsHost =
+      cloudRoom &&
+      ((cloudRoom.hostPlayerId && cloudRoom.hostPlayerId === account.playerId) ||
+        cloudRoom.hostName === account.username);
     setRoomModalOpen(false);
     setNotifDrawerOpen(false);
     setActiveIncomingBanner(null);
@@ -561,8 +632,15 @@ export default function App() {
       mode: 'room',
       category: (cloudRoom?.category as CategoryId) || roomCategory,
       roomCode: clean,
-      customOpponentName: cloudRoom?.hostName || `لاعب الغرفة #${clean}`,
-      customOpponentFlag: cloudRoom?.hostFlag || '🇸🇦',
+      customOpponentName: isJoiningAsHost
+        ? undefined
+        : cloudRoom?.hostName || undefined,
+      customOpponentFlag: isJoiningAsHost
+        ? undefined
+        : cloudRoom?.hostFlag || undefined,
+      customOpponentPlayerId: isJoiningAsHost
+        ? undefined
+        : cloudRoom?.hostPlayerId || undefined,
     });
   };
 
@@ -621,11 +699,12 @@ export default function App() {
 
     const unsubCloud = subscribeToIncomingCloudChallenges(
       account,
-      (roomCode, hostUid, hostName, hostFlag, category) => {
+      (roomCode, hostUid, hostName, hostFlag, category, hostPlayerId) => {
         // Check if this challenger is already in friends list or a new challenger
         const matchedFriend = account.friends.find(
           f =>
             f.uid === hostUid ||
+            (hostPlayerId && f.playerId === hostPlayerId) ||
             f.username.toLowerCase() === hostName.toLowerCase()
         );
         const invite: ChallengeNotificationItem = {
@@ -633,7 +712,8 @@ export default function App() {
           roomCode,
           category: (category as CategoryId) || 'cocktail',
           senderUid: hostUid,
-          senderPlayerId: matchedFriend?.playerId || '#لاعب_سحابي',
+          senderPlayerId:
+            matchedFriend?.playerId || hostPlayerId || '#لاعب_سحابي',
           senderName: hostName,
           senderFlag: hostFlag,
           timestamp: Date.now(),
@@ -707,9 +787,13 @@ export default function App() {
     const seed = code
       .split('')
       .reduce((acc, ch) => acc * 31 + ch.charCodeAt(0), 7);
-    await createCloudPrivateRoom(code, account, 'cocktail', seed).catch(
-      () => {}
-    );
+    await createCloudPrivateRoom(
+      code,
+      account,
+      'cocktail',
+      seed,
+      friend.playerId
+    ).catch(() => {});
     broadcastChallengeInvite(
       {
         id: `inv_${code}_${Date.now()}`,
@@ -737,12 +821,40 @@ export default function App() {
     });
   };
 
-  // 1. Splash Screen
+  // 1. Splash Screen (Real Firebase sync when online, instant local launch when offline)
   if (showSplash) {
     return (
       <SplashScreen
         existingAccount={account}
-        onFinish={() => setShowSplash(false)}
+        onFinish={result => {
+          if (result) {
+            isOnlineRef.current = result.isOnline;
+            setIsOnline(result.isOnline);
+            if (!result.isOnline) {
+              setSelectedMode(prev =>
+                prev === 'online' || prev === 'room' ? 'solo' : prev
+              );
+              setActiveTab(prev =>
+                prev === 'friends' || prev === 'leaderboard' || prev === 'store'
+                  ? 'arena'
+                  : prev
+              );
+            } else {
+              setSelectedMode(prev => (prev === 'solo' ? 'online' : prev));
+            }
+            if (result.accountPatch && account) {
+              const merged: PlayerAccount = {
+                ...account,
+                ...result.accountPatch,
+                updatedAt: Date.now(),
+              };
+              const res = persistUpdatedAccount(merged);
+              setAccount({ ...res.account });
+            }
+          }
+          showSplashRef.current = false;
+          setShowSplash(false);
+        }}
       />
     );
   }

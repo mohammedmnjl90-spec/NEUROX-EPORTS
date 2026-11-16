@@ -1,5 +1,6 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { WORLD_COUNTRIES } from '../data/constants';
+import { syncAuthAccountWithCloud } from '../services/firebase';
 import {
   createNewPlayerAccount,
   loginPlayerAccount,
@@ -7,7 +8,7 @@ import {
 } from '../services/storage';
 import { PlayerAccount } from '../types';
 import { soundFX } from '../utils/sound';
-import { Eye, EyeOff, UserPlus, LogIn } from 'lucide-react';
+import { Eye, EyeOff, UserPlus, LogIn, Wifi, WifiOff } from 'lucide-react';
 
 interface AuthScreenProps {
   onSuccess: (account: PlayerAccount) => void;
@@ -30,13 +31,29 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onSuccess }) => {
   const [loginIdentifier, setLoginIdentifier] = useState('');
   const [loginPassword, setLoginPassword] = useState('');
 
-  // Feedback
+  // Network & loading feedback
+  const [isOnline, setIsOnline] = useState<boolean>(() =>
+    typeof navigator !== 'undefined' ? navigator.onLine : true
+  );
+  const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    const goOnline = () => setIsOnline(true);
+    const goOffline = () => setIsOnline(false);
+    window.addEventListener('online', goOnline);
+    window.addEventListener('offline', goOffline);
+    return () => {
+      window.removeEventListener('online', goOnline);
+      window.removeEventListener('offline', goOffline);
+    };
+  }, []);
 
   const pwValidation = validateStrongPassword(password);
 
-  const handleRegister = (e: React.FormEvent) => {
+  const handleRegister = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSubmitting) return;
     soundFX.playClick();
     setErrorMsg(null);
 
@@ -79,12 +96,25 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onSuccess }) => {
       return;
     }
 
+    // If offline: skip cloud sync completely and enter immediately from localStorage
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      soundFX.playVictory();
+      onSuccess(res.account);
+      return;
+    }
+
+    // If online: show "جاري التحميل..." while syncing with Firestore (12s max safety timeout)
+    setIsSubmitting(true);
+    await syncAuthAccountWithCloud(res.account, 12000).catch(() => null);
+    setIsSubmitting(false);
+
     soundFX.playVictory();
     onSuccess(res.account);
   };
 
-  const handleLogin = (e: React.FormEvent) => {
+  const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSubmitting) return;
     soundFX.playClick();
     setErrorMsg(null);
 
@@ -95,10 +125,21 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onSuccess }) => {
       return;
     }
 
+    // If offline: enter immediately from localStorage without server wait
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      soundFX.playCorrect();
+      onSuccess(res.account);
+      return;
+    }
+
+    // If online: show "جاري التحميل..." while syncing with Firestore (12s max safety timeout)
+    setIsSubmitting(true);
+    await syncAuthAccountWithCloud(res.account, 12000).catch(() => null);
+    setIsSubmitting(false);
+
     soundFX.playCorrect();
     onSuccess(res.account);
   };
-
 
   return (
     <div className="min-h-screen bg-[#070A12] text-white flex flex-col justify-center items-center px-4 py-8">
@@ -114,18 +155,39 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onSuccess }) => {
           <p className="text-xs text-slate-400 mt-1">
             تسجيل الدخول مرة واحدة فقط · حفظ تلقائي لحسابك ونقاطك
           </p>
+
+          <div
+            className={`mt-3 inline-flex items-center gap-1.5 px-3 py-1 rounded-xl border text-[11px] font-bold ${
+              isOnline
+                ? 'bg-[#38D9A9]/15 border-[#38D9A9]/40 text-[#38D9A9]'
+                : 'bg-[#FF6B81]/15 border-[#FF6B81]/40 text-[#FF6B81]'
+            }`}
+          >
+            {isOnline ? (
+              <>
+                <Wifi className="w-3.5 h-3.5" />
+                <span>متصل بالإنترنت · مزامنة فورية مع Firebase</span>
+              </>
+            ) : (
+              <>
+                <WifiOff className="w-3.5 h-3.5" />
+                <span>أوفلاين · دخول فوري من التخزين المحلي (أطوار الفردي والمحلي فقط)</span>
+              </>
+            )}
+          </div>
         </div>
 
         {/* 2 Tabs: إنشاء حساب جديد | دخول لحسابي */}
         <div className="grid grid-cols-2 gap-2 p-1.5 rounded-2xl bg-[#070A12] border border-[#28354E] mb-6">
           <button
             type="button"
+            disabled={isSubmitting}
             onClick={() => {
               soundFX.playClick();
               setActiveTab('register');
               setErrorMsg(null);
             }}
-            className={`min-h-[44px] flex items-center justify-center gap-2 rounded-xl text-sm font-bold transition-all whitespace-nowrap ${
+            className={`min-h-[44px] flex items-center justify-center gap-2 rounded-xl text-sm font-bold transition-all whitespace-nowrap disabled:opacity-60 ${
               activeTab === 'register'
                 ? 'bg-[#4FF5D2] text-[#070A12] shadow-md'
                 : 'text-slate-300 hover:text-white'
@@ -137,12 +199,13 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onSuccess }) => {
 
           <button
             type="button"
+            disabled={isSubmitting}
             onClick={() => {
               soundFX.playClick();
               setActiveTab('login');
               setErrorMsg(null);
             }}
-            className={`min-h-[44px] flex items-center justify-center gap-2 rounded-xl text-sm font-bold transition-all whitespace-nowrap ${
+            className={`min-h-[44px] flex items-center justify-center gap-2 rounded-xl text-sm font-bold transition-all whitespace-nowrap disabled:opacity-60 ${
               activeTab === 'login'
                 ? 'bg-[#4FF5D2] text-[#070A12] shadow-md'
                 : 'text-slate-300 hover:text-white'
@@ -152,6 +215,13 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onSuccess }) => {
             <span>دخول لحسابي</span>
           </button>
         </div>
+
+        {isSubmitting && (
+          <div className="mb-5 rounded-2xl bg-[#4FF5D2]/15 border border-[#4FF5D2] px-4 py-3 text-xs text-[#4FF5D2] font-extrabold flex items-center gap-2.5">
+            <span className="inline-block w-4 h-4 rounded-full border-2 border-[#4FF5D2] border-t-transparent animate-spin shrink-0" />
+            <span>جاري التحميل... يتم الآن مزامنة بياناتك مع قاعدة بيانات Firebase</span>
+          </div>
+        )}
 
         {errorMsg && (
           <div className="mb-5 rounded-2xl bg-[#FF6B81]/15 border border-[#FF6B81] px-4 py-3 text-xs text-[#FF6B81] font-semibold">
@@ -312,9 +382,17 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onSuccess }) => {
 
             <button
               type="submit"
-              className="w-full min-h-[50px] rounded-2xl bg-gradient-to-r from-[#4FF5D2] to-[#38D9A9] text-[#070A12] font-extrabold text-sm shadow-lg hover:opacity-95 transition-opacity"
+              disabled={isSubmitting}
+              className="w-full min-h-[50px] rounded-2xl bg-gradient-to-r from-[#4FF5D2] to-[#38D9A9] text-[#070A12] font-extrabold text-sm shadow-lg hover:opacity-95 transition-opacity disabled:opacity-60 flex items-center justify-center gap-2"
             >
-              إنشاء حسابي ودخول الساحة 🚀
+              {isSubmitting ? (
+                <>
+                  <span className="inline-block w-4 h-4 rounded-full border-2 border-[#070A12] border-t-transparent animate-spin" />
+                  <span>جاري التحميل...</span>
+                </>
+              ) : (
+                <span>إنشاء حسابي ودخول الساحة 🚀</span>
+              )}
             </button>
           </form>
         ) : (
@@ -349,9 +427,17 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onSuccess }) => {
 
             <button
               type="submit"
-              className="w-full min-h-[50px] rounded-2xl bg-gradient-to-r from-[#4FF5D2] to-[#38D9A9] text-[#070A12] font-extrabold text-sm shadow-lg hover:opacity-95 transition-opacity"
+              disabled={isSubmitting}
+              className="w-full min-h-[50px] rounded-2xl bg-gradient-to-r from-[#4FF5D2] to-[#38D9A9] text-[#070A12] font-extrabold text-sm shadow-lg hover:opacity-95 transition-opacity disabled:opacity-60 flex items-center justify-center gap-2"
             >
-              استرجاع حسابي والدخول 🔐
+              {isSubmitting ? (
+                <>
+                  <span className="inline-block w-4 h-4 rounded-full border-2 border-[#070A12] border-t-transparent animate-spin" />
+                  <span>جاري التحميل...</span>
+                </>
+              ) : (
+                <span>استرجاع حسابي والدخول 🔐</span>
+              )}
             </button>
           </form>
         )}
