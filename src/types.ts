@@ -187,6 +187,7 @@ export interface PlayerAccount {
   botDifficulty: BotDifficulty;
   botPersona: BotPersona;
   ownedBorders?: ProfileBorderId[];
+  unlockedBorders?: ProfileBorderId[];
   equippedBorder?: ProfileBorderId;
   ownedThemes?: UiThemeId[];
   equippedTheme?: UiThemeId;

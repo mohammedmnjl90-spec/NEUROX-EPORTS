@@ -296,8 +296,9 @@ export const FriendsAndChatView: React.FC<FriendsAndChatViewProps> = ({
   } | null>(null);
 
   // Filter out any legacy demo friends automatically so only real added friends remain
-  const realFriends = account.friends.filter(
-    f => f.uid !== 'friend_demo_1' && f.uid !== 'friend_demo_2'
+  const safeFriends = Array.isArray(account.friends) ? account.friends : [];
+  const realFriends = safeFriends.filter(
+    f => f && f.uid !== 'friend_demo_1' && f.uid !== 'friend_demo_2'
   );
 
   // Sort Favorite Friends to the top
@@ -305,7 +306,7 @@ export const FriendsAndChatView: React.FC<FriendsAndChatViewProps> = ({
     if (Boolean(a.isFavorite) !== Boolean(b.isFavorite)) {
       return a.isFavorite ? -1 : 1;
     }
-    return b.addedAt - a.addedAt;
+    return (b.addedAt || 0) - (a.addedAt || 0);
   });
 
   const [activeFriend, setActiveFriend] = useState<FriendItem | null>(
@@ -319,7 +320,7 @@ export const FriendsAndChatView: React.FC<FriendsAndChatViewProps> = ({
     useState<SportsmanshipBadgeId>('fair_competitor');
 
   useEffect(() => {
-    if (account.friends.length !== realFriends.length) {
+    if (safeFriends.length !== realFriends.length) {
       onUpdateAccount({ ...account, friends: realFriends });
     }
   }, []);
@@ -513,14 +514,15 @@ export const FriendsAndChatView: React.FC<FriendsAndChatViewProps> = ({
   };
 
   const handleSendQuickInvite = async (friend: FriendItem) => {
-    if (!navigator.onLine) {
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
       soundFX.playWrong();
       setSearchError(t.requiresInternet);
       return;
     }
 
+    const safeTargetId = friend?.playerId || '';
     soundFX.playClick();
-    setSendingQuickInviteId(friend.playerId);
+    setSendingQuickInviteId(safeTargetId);
     setActiveFriend(friend);
     setFavoriteOnlineAlertFriend(null);
 
@@ -528,8 +530,8 @@ export const FriendsAndChatView: React.FC<FriendsAndChatViewProps> = ({
       const created = await sendQuickChallengeInvite(
         account,
         quickCategory,
-        friend.playerId
-      );
+        safeTargetId
+      ).catch(() => null);
       const code =
         created?.roomCode ||
         Math.floor(1000 + Math.random() * 9000).toString();
@@ -539,21 +541,21 @@ export const FriendsAndChatView: React.FC<FriendsAndChatViewProps> = ({
           id: `qinv_${code}_${Date.now()}`,
           roomCode: code,
           category: quickCategory,
-          senderUid: account.uid,
-          senderPlayerId: account.playerId,
-          senderName: account.username,
-          senderFlag: account.countryFlag,
+          senderUid: account.uid || '',
+          senderPlayerId: account.playerId || '',
+          senderName: account.username || 'لاعب',
+          senderFlag: account.countryFlag || '🇸🇦',
           timestamp: Date.now(),
           read: false,
         },
-        friend.playerId
+        safeTargetId
       );
 
       const inviteMsg: ChatMessageItem = {
         id: `msg_qinv_${Date.now()}`,
-        friendId: friend.playerId,
-        senderId: account.playerId,
-        senderName: account.username,
+        friendId: safeTargetId,
+        senderId: account.playerId || '',
+        senderName: account.username || 'لاعب',
         text: `${p.quickInviteChatText} (#${code})`,
         isChallenge: true,
         roomCode: code,
@@ -568,6 +570,13 @@ export const FriendsAndChatView: React.FC<FriendsAndChatViewProps> = ({
         roomCode: code,
         category: quickCategory,
       });
+
+      // Open MatchArena room screen immediately so the challenger enters the waiting room right away
+      if (onStartDirectChallenge) {
+        onStartDirectChallenge(friend, code, quickCategory);
+      } else {
+        onChallengeFriend(friend);
+      }
     } finally {
       setSendingQuickInviteId(null);
     }

@@ -4,6 +4,9 @@ import { syncAuthAccountWithCloud } from '../services/firebase';
 import {
   createNewPlayerAccount,
   loginPlayerAccount,
+  persistUpdatedAccount,
+  sanitizePlayerAccount,
+  setActiveAccountUid,
   validateStrongPassword,
 } from '../services/storage';
 import { PlayerAccount } from '../types';
@@ -96,20 +99,25 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onSuccess }) => {
       return;
     }
 
+    // Immediately normalize and persist account to localStorage before anything else
+    const sanitizedAcc = sanitizePlayerAccount(res.account);
+    setActiveAccountUid(sanitizedAcc.uid);
+    const persisted = persistUpdatedAccount(sanitizedAcc);
+
     // If offline: skip cloud sync completely and enter immediately from localStorage
     if (typeof navigator !== 'undefined' && !navigator.onLine) {
       soundFX.playVictory();
-      onSuccess(res.account);
+      onSuccess(persisted.account);
       return;
     }
 
     // If online: show "جاري التحميل..." while syncing with Firestore (12s max safety timeout)
     setIsSubmitting(true);
-    await syncAuthAccountWithCloud(res.account, 12000).catch(() => null);
+    await syncAuthAccountWithCloud(persisted.account, 12000).catch(() => null);
     setIsSubmitting(false);
 
     soundFX.playVictory();
-    onSuccess(res.account);
+    onSuccess(persisted.account);
   };
 
   const handleLogin = async (e: React.FormEvent) => {
@@ -125,20 +133,25 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onSuccess }) => {
       return;
     }
 
+    // Immediately normalize and persist account to localStorage before anything else
+    const sanitizedAcc = sanitizePlayerAccount(res.account);
+    setActiveAccountUid(sanitizedAcc.uid);
+    const persisted = persistUpdatedAccount(sanitizedAcc);
+
     // If offline: enter immediately from localStorage without server wait
     if (typeof navigator !== 'undefined' && !navigator.onLine) {
       soundFX.playCorrect();
-      onSuccess(res.account);
+      onSuccess(persisted.account);
       return;
     }
 
     // If online: show "جاري التحميل..." while syncing with Firestore (12s max safety timeout)
     setIsSubmitting(true);
-    await syncAuthAccountWithCloud(res.account, 12000).catch(() => null);
+    await syncAuthAccountWithCloud(persisted.account, 12000).catch(() => null);
     setIsSubmitting(false);
 
     soundFX.playCorrect();
-    onSuccess(res.account);
+    onSuccess(persisted.account);
   };
 
   return (

@@ -16,7 +16,12 @@ import { soundFX } from '../utils/sound';
 import { getLocalizedCategory, getViewTranslations } from '../utils/i18n';
 import confetti from 'canvas-confetti';
 import { Flag, Volume2, VolumeX, Star } from 'lucide-react';
-import { subscribeToCloudRoom, updateCloudRoomState } from '../services/firebase';
+import {
+  createCloudPrivateRoom,
+  joinCloudPrivateRoom,
+  subscribeToCloudRoom,
+  updateCloudRoomState,
+} from '../services/firebase';
 
 interface MatchArenaProps {
   account: PlayerAccount;
@@ -247,139 +252,192 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
   useEffect(() => {
     if (mode !== 'room' || !roomCode) return;
 
-    const unsub = subscribeToCloudRoom(roomCode, data => {
-      const hostUid = String(data.hostUid || '');
-      const hostName = String(data.hostName || '');
-      const hostFlag = String(data.hostFlag || '🇸🇦');
-      const hostPlayerId = String(data.hostPlayerId || '');
-      const guestUid = String(data.guestUid || '');
-      const guestName = String(data.guestName || '');
-      const guestFlag = String(data.guestFlag || '🇸🇦');
-      const guestPlayerId = String(data.guestPlayerId || '');
-      const status = String(data.status || 'waiting') as
-        | 'waiting'
-        | 'active'
-        | 'finished'
-        | 'completed';
+    let hasReceivedRoomDoc = false;
+    let isJoiningGuestInFlight = false;
 
-      setRoomCloudStatus(status === 'completed' ? 'finished' : status);
+    const ensureRoomProvisioned = () => {
+      if (hasReceivedRoomDoc) return;
+      createCloudPrivateRoom(
+        roomCode,
+        account,
+        category,
+        numericSeed || 7,
+        customOpponentPlayerId || ''
+      ).catch(() => {});
+    };
 
-      // Determine whether this device is the Host or the Guest
-      const isHost =
-        (hostPlayerId && hostPlayerId === account.playerId) ||
-        (!guestPlayerId && hostName === account.username) ||
-        (hostName === account.username && guestName !== account.username);
-      isRoomHostRef.current = isHost;
+    const unsub = subscribeToCloudRoom(
+      roomCode,
+      data => {
+        hasReceivedRoomDoc = true;
+        const hostUid = String(data.hostUid || '');
+        const hostName = String(data.hostName || '');
+        const hostFlag = String(data.hostFlag || '🇸🇦');
+        const hostPlayerId = String(data.hostPlayerId || '');
+        const guestUid = String(data.guestUid || '');
+        const guestName = String(data.guestName || '');
+        const guestFlag = String(data.guestFlag || '🇸🇦');
+        const guestPlayerId = String(data.guestPlayerId || '');
+        const status = String(data.status || 'waiting') as
+          | 'waiting'
+          | 'active'
+          | 'finished'
+          | 'completed';
 
-      const remoteName = isHost ? guestName : hostName;
-      const remoteFlag = isHost ? guestFlag : hostFlag;
-      const remotePid = isHost ? guestPlayerId : hostPlayerId;
+        setRoomCloudStatus(status === 'completed' ? 'finished' : status);
 
-      if (remoteName && remoteName.trim().length >= 1) {
-        setOpponentName(remoteName);
-        setOpponentFlag(remoteFlag || '🇸🇦');
-        setOpponentIsBot(false);
-        if (remotePid) {
-          setOpponentPlayerId(remotePid);
+        // Determine whether this device is the Host or the Guest
+        const isHost =
+          (hostPlayerId && hostPlayerId === account.playerId) ||
+          (!guestPlayerId && hostName === account.username) ||
+          (hostName === account.username && guestName !== account.username);
+        isRoomHostRef.current = isHost;
+
+        // If this device is the Guest and the room is still 'waiting' without a guestUid, join immediately
+        if (
+          !isHost &&
+          status === 'waiting' &&
+          !guestUid &&
+          !isJoiningGuestInFlight
+        ) {
+          isJoiningGuestInFlight = true;
+          joinCloudPrivateRoom(roomCode, account)
+            .catch(() => null)
+            .finally(() => {
+              isJoiningGuestInFlight = false;
+            });
         }
-      }
 
-      // Synchronize unified questionSeeds array from Firestore so both devices get identical questions
-      if (Array.isArray(data.questionSeeds) && data.questionSeeds.length > 0) {
-        const seedsArr = data.questionSeeds.map((n: unknown) => Number(n) || 0);
-        const key = seedsArr.join(',');
-        if (appliedSeedsKeyRef.current !== key) {
-          appliedSeedsKeyRef.current = key;
-          const qSeed = Number(data.questionSeed || numericSeed || 7);
-          setQuestions(
-            getMatchQuestions(
-              category,
-              25,
-              account.seenQuestionIds,
-              qSeed,
-              seedsArr
-            )
+        const remoteName = isHost ? guestName : hostName;
+        const remoteFlag = isHost ? guestFlag : hostFlag;
+        const remotePid = isHost ? guestPlayerId : hostPlayerId;
+
+        if (remoteName && remoteName.trim().length >= 1) {
+          setOpponentName(remoteName);
+          setOpponentFlag(remoteFlag || '🇸🇦');
+          setOpponentIsBot(false);
+          if (remotePid) {
+            setOpponentPlayerId(remotePid);
+          }
+        }
+
+        // Synchronize unified questionSeeds array from Firestore so both devices get identical questions
+        if (Array.isArray(data.questionSeeds) && data.questionSeeds.length > 0) {
+          const seedsArr = data.questionSeeds.map((n: unknown) => Number(n) || 0);
+          const key = seedsArr.join(',');
+          if (appliedSeedsKeyRef.current !== key) {
+            appliedSeedsKeyRef.current = key;
+            const qSeed = Number(data.questionSeed || numericSeed || 7);
+            setQuestions(
+              getMatchQuestions(
+                category,
+                25,
+                account.seenQuestionIds || [],
+                qSeed,
+                seedsArr
+              )
+            );
+          }
+        }
+
+        // Synchronize live scores and answered round/question step from the opponent's device
+        const remoteScore = Number(
+          isHost ? data.guestScore ?? 0 : data.hostScore ?? 0
+        );
+        const remoteAnswered = Number(
+          isHost ? data.guestAnsweredRound ?? 0 : data.hostAnsweredRound ?? 0
+        );
+        const remoteReadyBreak = Boolean(
+          isHost ? data.guestReadyNextRound : data.hostReadyNextRound
+        );
+
+        remoteAnsweredStepRef.current = remoteAnswered;
+        totalOpponentPointsRef.current = remoteScore;
+        setTotalOpponentPoints(remoteScore);
+
+        const computedOppRoundPts = Math.max(
+          0,
+          remoteScore - roundStartOpponentTotalRef.current
+        );
+        opponentRoundPointsRef.current = computedOppRoundPts;
+        setOpponentRoundPoints(computedOppRoundPts);
+
+        if (phaseRef.current === 'ROUND_BREAK' && remoteReadyBreak) {
+          setOpponentReadyBreak(true);
+        }
+
+        // Transition from MATCHMAKING ('waiting') -> PLAYING_ROUND ONLY when Guest actually joins and status === 'active'
+        if (
+          phaseRef.current === 'MATCHMAKING' &&
+          status === 'active' &&
+          (guestUid.length > 0 || guestName.length > 0)
+        ) {
+          soundFX.playCorrect();
+          answerLockRef.current = false;
+          setIsAnswerLocked(false);
+          setTimeLeft(6);
+          questionStartMsRef.current = Date.now();
+          setPhase('PLAYING_ROUND');
+        }
+
+        // During PLAYING_ROUND or SUDDEN_DEATH: if both devices have now answered the current step, advance immediately!
+        const activeStep =
+          phaseRef.current === 'SUDDEN_DEATH'
+            ? 25
+            : (currentRoundRef.current - 1) * 8 + questionInRoundRef.current;
+
+        if (
+          (phaseRef.current === 'PLAYING_ROUND' ||
+            phaseRef.current === 'SUDDEN_DEATH') &&
+          myAnsweredStepRef.current >= activeStep &&
+          remoteAnswered >= activeStep &&
+          stepAdvancedRef.current < activeStep
+        ) {
+          stepAdvancedRef.current = activeStep;
+          setWaitingOpponentStep(false);
+          window.setTimeout(() => {
+            proceedToNextRoomStep(activeStep);
+          }, 650);
+        }
+
+        // If opponent finished/forfeited early while we are still in an earlier round
+        if (
+          (status === 'finished' || status === 'completed') &&
+          phaseRef.current !== 'MATCH_OVER' &&
+          phaseRef.current !== 'MATCHMAKING' &&
+          remoteAnswered < 24 &&
+          myAnsweredStepRef.current > remoteAnswered + 1
+        ) {
+          triggerMatchEnd(
+            'forfeit_win',
+            'انسحب الخصم أو غادر الغرفة السحابية، وتم احتساب الفوز لصالحك!'
           );
         }
+      },
+      () => {
+        // Room document not found yet in Firestore -> create it immediately in waiting state
+        ensureRoomProvisioned();
       }
+    );
 
-      // Synchronize live scores and answered round/question step from the opponent's device
-      const remoteScore = Number(isHost ? data.guestScore ?? 0 : data.hostScore ?? 0);
-      const remoteAnswered = Number(
-        isHost ? data.guestAnsweredRound ?? 0 : data.hostAnsweredRound ?? 0
-      );
-      const remoteReadyBreak = Boolean(
-        isHost ? data.guestReadyNextRound : data.hostReadyNextRound
-      );
-
-      remoteAnsweredStepRef.current = remoteAnswered;
-      totalOpponentPointsRef.current = remoteScore;
-      setTotalOpponentPoints(remoteScore);
-
-      const computedOppRoundPts = Math.max(
-        0,
-        remoteScore - roundStartOpponentTotalRef.current
-      );
-      opponentRoundPointsRef.current = computedOppRoundPts;
-      setOpponentRoundPoints(computedOppRoundPts);
-
-      if (phaseRef.current === 'ROUND_BREAK' && remoteReadyBreak) {
-        setOpponentReadyBreak(true);
+    const retryInterval = window.setInterval(() => {
+      if (phaseRef.current === 'MATCHMAKING' && !hasReceivedRoomDoc) {
+        ensureRoomProvisioned();
       }
-
-      // Transition from MATCHMAKING ('waiting') -> PLAYING_ROUND ONLY when Guest actually joins and status === 'active'
-      if (
-        phaseRef.current === 'MATCHMAKING' &&
-        status === 'active' &&
-        (guestUid.length > 0 || guestName.length > 0)
-      ) {
-        soundFX.playCorrect();
-        answerLockRef.current = false;
-        setIsAnswerLocked(false);
-        setTimeLeft(6);
-        questionStartMsRef.current = Date.now();
-        setPhase('PLAYING_ROUND');
-      }
-
-      // During PLAYING_ROUND or SUDDEN_DEATH: if both devices have now answered the current step, advance immediately!
-      const activeStep =
-        phaseRef.current === 'SUDDEN_DEATH'
-          ? 25
-          : (currentRoundRef.current - 1) * 8 + questionInRoundRef.current;
-
-      if (
-        (phaseRef.current === 'PLAYING_ROUND' ||
-          phaseRef.current === 'SUDDEN_DEATH') &&
-        myAnsweredStepRef.current >= activeStep &&
-        remoteAnswered >= activeStep &&
-        stepAdvancedRef.current < activeStep
-      ) {
-        stepAdvancedRef.current = activeStep;
-        setWaitingOpponentStep(false);
-        window.setTimeout(() => {
-          proceedToNextRoomStep(activeStep);
-        }, 650);
-      }
-
-      // If opponent finished/forfeited early while we are still in an earlier round
-      if (
-        (status === 'finished' || status === 'completed') &&
-        phaseRef.current !== 'MATCH_OVER' &&
-        phaseRef.current !== 'MATCHMAKING' &&
-        remoteAnswered < 24 &&
-        myAnsweredStepRef.current > remoteAnswered + 1
-      ) {
-        triggerMatchEnd(
-          'forfeit_win',
-          'انسحب الخصم أو غادر الغرفة السحابية، وتم احتساب الفوز لصالحك!'
-        );
-      }
-    });
+    }, 3000);
 
     return () => {
       if (unsub) unsub();
+      window.clearInterval(retryInterval);
     };
-  }, [mode, roomCode, account.playerId, account.username, category]);
+  }, [
+    mode,
+    roomCode,
+    account.playerId,
+    account.username,
+    category,
+    customOpponentPlayerId,
+  ]);
 
   // 1B. Matchmaking countdown ONLY for `mode === 'online'` (NEVER for `mode === 'room'`)
   useEffect(() => {

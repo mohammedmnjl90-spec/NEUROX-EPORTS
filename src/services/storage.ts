@@ -12,13 +12,16 @@ import {
   EconomyLedgerEntry,
   HourlyAdConfig,
   PlayerAccount,
+  ProfileBorderId,
   PromoVipCode,
+  UiThemeId,
   VipPaymentRequest,
   VipTier,
 } from '../types';
 import { ownerMutatePlayerInFirestore, syncPlayerToCloud } from './firebase';
 
 const ACTIVE_USER_KEY = 'neurox_active_uid_v1';
+const ACTIVE_ACCOUNT_SNAPSHOT_KEY = 'neurox_active_account_snapshot_v1';
 const ACCOUNTS_REGISTRY_KEY = 'neurox_accounts_registry_v1';
 const CHAT_MESSAGES_KEY = 'neurox_chat_messages_v1';
 const OWNER_PLAYER_OVERRIDES_KEY = 'neurox_owner_player_overrides_v1';
@@ -49,7 +52,7 @@ export function saveOwnerPlayerOverride(player: CloudManagedPlayer): void {
     for (const [uid, acc] of Object.entries(registry)) {
       if (acc.uid === player.uid || acc.playerId === player.playerId) {
         const { currentRank } = computeLevelInfo(player.xp);
-        registry[uid] = {
+        registry[uid] = sanitizePlayerAccount({
           ...acc,
           username: player.username,
           countryCode: player.countryCode,
@@ -63,7 +66,7 @@ export function saveOwnerPlayerOverride(player: CloudManagedPlayer): void {
           fairPlayScore: player.fairPlayScore,
           isBanned: player.isBanned,
           updatedAt: Date.now(),
-        };
+        });
       }
     }
     saveAllAccounts(registry);
@@ -79,6 +82,7 @@ export function getTodayDateStr(): string {
 
 export function loadPlaytimeSeconds(uid: string, fallback = 0): number {
   try {
+    if (!uid) return Math.max(0, Math.floor(Number(fallback) || 0));
     const raw = localStorage.getItem(`${PLAYTIME_TRACKER_PREFIX}${uid}`);
     if (raw === null) return Math.max(0, Math.floor(Number(fallback) || 0));
     return Math.max(0, Math.floor(Number(raw) || 0));
@@ -89,6 +93,7 @@ export function loadPlaytimeSeconds(uid: string, fallback = 0): number {
 
 export function savePlaytimeSeconds(uid: string, seconds: number): void {
   try {
+    if (!uid) return;
     const safeSec = Math.max(0, Math.floor(Number(seconds) || 0));
     localStorage.setItem(`${PLAYTIME_TRACKER_PREFIX}${uid}`, String(safeSec));
     const registry = loadAllAccounts();
@@ -99,13 +104,58 @@ export function savePlaytimeSeconds(uid: string, seconds: number): void {
   } catch {}
 }
 
-export function sanitizeAccount(rawAcc: PlayerAccount): PlayerAccount {
+/**
+ * Normalizes and secures any PlayerAccount coming from Login, Cloud Firestore, or localStorage
+ * so every field (arrays, objects, borders, themes, language, xp, coins) has a safe non-undefined default.
+ */
+export function sanitizePlayerAccount(
+  rawAcc?: Partial<PlayerAccount> | null
+): PlayerAccount {
+  const safeRaw: Partial<PlayerAccount> =
+    rawAcc && typeof rawAcc === 'object' ? rawAcc : {};
   const today = getTodayDateStr();
-  const safeXp = Math.max(0, Math.floor(Number(rawAcc.xp) || 0));
-  const { currentRank } = computeLevelInfo(safeXp);
-  const safeCoins = Math.max(0, Math.floor(Number(rawAcc.coins) || 0));
+  const now = Date.now();
 
-  const rawLedger = Array.isArray(rawAcc.ledger) ? [...rawAcc.ledger] : [];
+  const safeUid =
+    typeof safeRaw.uid === 'string' && safeRaw.uid.trim().length > 0
+      ? safeRaw.uid.trim()
+      : `usr_${now}`;
+
+  const safePlayerId =
+    typeof safeRaw.playerId === 'string' &&
+    /^#[0-9]{10}$/.test(safeRaw.playerId.trim())
+      ? safeRaw.playerId.trim()
+      : `#${Math.floor(1000000000 + Math.random() * 9000000000)}`;
+
+  const safeUsername =
+    typeof safeRaw.username === 'string' && safeRaw.username.trim().length >= 2
+      ? safeRaw.username.trim()
+      : 'لاعب_الميدان';
+
+  const safeCountryCode =
+    typeof safeRaw.countryCode === 'string' && safeRaw.countryCode.trim()
+      ? safeRaw.countryCode.trim()
+      : 'SA';
+  const matchedCountry =
+    WORLD_COUNTRIES.find(c => c.code === safeCountryCode) || WORLD_COUNTRIES[0];
+
+  const safeXp =
+    typeof safeRaw.xp === 'number' && !Number.isNaN(safeRaw.xp)
+      ? Math.max(0, Math.floor(safeRaw.xp))
+      : 0;
+  const { currentRank } = computeLevelInfo(safeXp);
+
+  const hasValidCoins =
+    safeRaw.coins !== undefined &&
+    safeRaw.coins !== null &&
+    !Number.isNaN(Number(safeRaw.coins));
+  const safeCoins = hasValidCoins
+    ? Math.max(0, Math.floor(Number(safeRaw.coins)))
+    : 500;
+
+  const rawLedger = Array.isArray(safeRaw.ledger)
+    ? safeRaw.ledger.filter(Boolean)
+    : [];
   if (rawLedger.length > 0 && rawLedger[0].balanceAfter !== safeCoins) {
     rawLedger[0] = {
       ...rawLedger[0],
@@ -115,38 +165,164 @@ export function sanitizeAccount(rawAcc: PlayerAccount): PlayerAccount {
 
   // Apply any owner override if present
   const overrides = loadOwnerPlayerOverrides();
-  const ov = overrides[rawAcc.playerId] || overrides[rawAcc.uid];
-  const effectiveVipTier = ov?.vipTier || rawAcc.vipTier || 'basic';
+  const ov = overrides[safePlayerId] || overrides[safeUid];
+  const validVipTiers: VipTier[] = ['basic', 'bronze', 'silver', 'royal_gold'];
+  const rawVip = ov?.vipTier || safeRaw.vipTier || 'basic';
+  const effectiveVipTier: VipTier = validVipTiers.includes(rawVip as VipTier)
+    ? (rawVip as VipTier)
+    : 'basic';
+
+  const rawBorders: ProfileBorderId[] = Array.isArray(safeRaw.unlockedBorders)
+    ? safeRaw.unlockedBorders
+    : Array.isArray(safeRaw.ownedBorders)
+    ? safeRaw.ownedBorders
+    : ['default_cyan'];
+  const safeBorders: ProfileBorderId[] = Array.from(
+    new Set<ProfileBorderId>(['default_cyan', ...rawBorders.filter(Boolean)])
+  );
+
+  const rawThemes: UiThemeId[] = Array.isArray(safeRaw.ownedThemes)
+    ? safeRaw.ownedThemes
+    : ['midnight_cyan'];
+  const safeThemes: UiThemeId[] = Array.from(
+    new Set<UiThemeId>(['midnight_cyan', ...rawThemes.filter(Boolean)])
+  );
+
+  const safeEquippedBorder =
+    safeRaw.equippedBorder &&
+    PROFILE_BORDERS_CATALOG.some(b => b.id === safeRaw.equippedBorder)
+      ? safeRaw.equippedBorder
+      : 'default_cyan';
+
+  const safeEquippedTheme =
+    safeRaw.equippedTheme &&
+    UI_THEMES_CATALOG.some(th => th.id === safeRaw.equippedTheme)
+      ? safeRaw.equippedTheme
+      : 'midnight_cyan';
+
+  const validLangs = ['ar', 'en', 'fr', 'es', 'tr', 'ur'] as const;
+  const safeLanguage =
+    safeRaw.language &&
+    validLangs.includes(safeRaw.language as (typeof validLangs)[number])
+      ? safeRaw.language
+      : 'ar';
+
+  const safeFriends = Array.isArray(safeRaw.friends)
+    ? safeRaw.friends
+        .filter(f => f && typeof f === 'object')
+        .map(f => ({
+          uid: String(f.uid || `fr_${Date.now()}`),
+          playerId: String(f.playerId || '#1000000000'),
+          username: String(f.username || 'صديق'),
+          countryFlag: String(f.countryFlag || '🇸🇦'),
+          rating: Math.max(0, Math.floor(Number(f.rating ?? 1200))),
+          vipTier: validVipTiers.includes(f.vipTier as VipTier)
+            ? f.vipTier
+            : 'basic',
+          addedAt: Number(f.addedAt || now),
+          isFavorite: Boolean(f.isFavorite),
+          sportsmanshipAvg: Number(f.sportsmanshipAvg ?? 5.0),
+          sportsmanshipCount: Number(f.sportsmanshipCount ?? 1),
+          lastBadge: f.lastBadge,
+          presenceStatus: f.presenceStatus || 'offline',
+          lastSeenMs: Number(f.lastSeenMs || 0),
+          activeRoomCode: f.activeRoomCode || '',
+        }))
+    : [];
+
+  const safeMatchHistory = Array.isArray(safeRaw.matchHistory)
+    ? safeRaw.matchHistory.filter(m => m && typeof m === 'object')
+    : [];
 
   return {
-    ...rawAcc,
+    uid: safeUid,
+    playerId: safePlayerId,
+    username: safeUsername,
+    passwordHash: String(safeRaw.passwordHash || ''),
+    contactType: safeRaw.contactType === 'email' ? 'email' : 'phone',
+    contactValue: String(safeRaw.contactValue || ''),
+    countryCode: matchedCountry.code,
+    countryFlag: String(safeRaw.countryFlag || matchedCountry.flag || '🇸🇦'),
+    countryName: String(safeRaw.countryName || matchedCountry.nameAr || 'السعودية'),
     xp: safeXp,
     level: currentRank.level,
     coins: safeCoins,
-    monthlyPoints: Math.max(0, Math.floor(Number(rawAcc.monthlyPoints) || 0)),
-    rating: Math.max(0, Math.floor(Number(rawAcc.rating ?? 1200))),
+    monthlyPoints: Math.max(0, Math.floor(Number(safeRaw.monthlyPoints) || 0)),
+    rating: Math.max(0, Math.floor(Number(safeRaw.rating ?? 1200))),
     vipTier: effectiveVipTier,
-    fairPlayScore: Math.max(0, Math.min(100, Math.floor(Number(rawAcc.fairPlayScore ?? 100)))),
-    playtimeSeconds: loadPlaytimeSeconds(rawAcc.uid, rawAcc.playtimeSeconds ?? 0),
-    isBanned: Boolean(ov ? ov.isBanned : rawAcc.isBanned),
+    fairPlayScore: Math.max(
+      0,
+      Math.min(100, Math.floor(Number(safeRaw.fairPlayScore ?? 100)))
+    ),
+    sportsmanshipAvg: Number(safeRaw.sportsmanshipAvg ?? 5.0),
+    sportsmanshipCount: Math.max(1, Math.floor(Number(safeRaw.sportsmanshipCount ?? 1))),
+    sportsmanshipBadges:
+      safeRaw.sportsmanshipBadges && typeof safeRaw.sportsmanshipBadges === 'object'
+        ? safeRaw.sportsmanshipBadges
+        : {},
+    givenReviews: Array.isArray(safeRaw.givenReviews) ? safeRaw.givenReviews : [],
+    playtimeSeconds: loadPlaytimeSeconds(safeUid, safeRaw.playtimeSeconds ?? 0),
+    isBanned: Boolean(ov ? ov.isBanned : safeRaw.isBanned),
     lifelines: {
-      fiftyFifty: Math.max(0, Math.floor(Number(rawAcc.lifelines?.fiftyFifty ?? 1))),
-      freezeTime: Math.max(0, Math.floor(Number(rawAcc.lifelines?.freezeTime ?? 1))),
-      autoSolve: Math.max(0, Math.floor(Number(rawAcc.lifelines?.autoSolve ?? 1))),
+      fiftyFifty: Math.max(
+        0,
+        Math.floor(Number(safeRaw.lifelines?.fiftyFifty ?? 1))
+      ),
+      freezeTime: Math.max(
+        0,
+        Math.floor(Number(safeRaw.lifelines?.freezeTime ?? 1))
+      ),
+      autoSolve: Math.max(
+        0,
+        Math.floor(Number(safeRaw.lifelines?.autoSolve ?? 1))
+      ),
     },
-    onlineWins: Math.max(0, Math.floor(Number(rawAcc.onlineWins) || 0)),
-    totalMatches: Math.max(0, Math.floor(Number(rawAcc.totalMatches) || 0)),
-    totalDraws: Math.max(0, Math.floor(Number(rawAcc.totalDraws) || 0)),
-    totalCorrectAnswers: Math.max(0, Math.floor(Number(rawAcc.totalCorrectAnswers) || 0)),
-    goldenCorrectAnswers: Math.max(0, Math.floor(Number(rawAcc.goldenCorrectAnswers) || 0)),
-    maxComboReached: Math.max(0, Math.floor(Number(rawAcc.maxComboReached) || 0)),
-    unlockedAchievements: Array.isArray(rawAcc.unlockedAchievements)
-      ? rawAcc.unlockedAchievements
+    onlineWins: Math.max(0, Math.floor(Number(safeRaw.onlineWins) || 0)),
+    totalMatches: Math.max(0, Math.floor(Number(safeRaw.totalMatches) || 0)),
+    totalDraws: Math.max(0, Math.floor(Number(safeRaw.totalDraws) || 0)),
+    totalCorrectAnswers: Math.max(
+      0,
+      Math.floor(Number(safeRaw.totalCorrectAnswers) || 0)
+    ),
+    goldenCorrectAnswers: Math.max(
+      0,
+      Math.floor(Number(safeRaw.goldenCorrectAnswers) || 0)
+    ),
+    maxComboReached: Math.max(0, Math.floor(Number(safeRaw.maxComboReached) || 0)),
+    unlockedAchievements: Array.isArray(safeRaw.unlockedAchievements)
+      ? safeRaw.unlockedAchievements.filter(Boolean)
       : [],
-    seenQuestionIds: Array.isArray(rawAcc.seenQuestionIds) ? rawAcc.seenQuestionIds : [],
+    seenQuestionIds: Array.isArray(safeRaw.seenQuestionIds)
+      ? safeRaw.seenQuestionIds.filter(Boolean)
+      : [],
+    lastLoginDate: String(safeRaw.lastLoginDate || today),
+    loginStreak: Math.max(1, Math.floor(Number(safeRaw.loginStreak ?? 1))),
+    lastSpinDate: String(safeRaw.lastSpinDate || ''),
+    adsWatchedDate: String(safeRaw.adsWatchedDate || today),
+    adsWatchedCount: Math.max(0, Math.floor(Number(safeRaw.adsWatchedCount ?? 0))),
+    lastShareDate: String(safeRaw.lastShareDate || ''),
+    lastDailyBossDate: String(safeRaw.lastDailyBossDate || ''),
     dailyMissions:
-      rawAcc.dailyMissions && rawAcc.dailyMissions.dateStr === today
-        ? rawAcc.dailyMissions
+      safeRaw.dailyMissions && safeRaw.dailyMissions.dateStr === today
+        ? {
+            dateStr: today,
+            onlineWins: Math.max(0, Number(safeRaw.dailyMissions.onlineWins) || 0),
+            onlineWinsClaimed: Boolean(safeRaw.dailyMissions.onlineWinsClaimed),
+            correctAnswers: Math.max(
+              0,
+              Number(safeRaw.dailyMissions.correctAnswers) || 0
+            ),
+            correctAnswersClaimed: Boolean(
+              safeRaw.dailyMissions.correctAnswersClaimed
+            ),
+            quranCorrect: Math.max(
+              0,
+              Number(safeRaw.dailyMissions.quranCorrect) || 0
+            ),
+            quranCorrectClaimed: Boolean(
+              safeRaw.dailyMissions.quranCorrectClaimed
+            ),
+          }
         : {
             dateStr: today,
             onlineWins: 0,
@@ -157,16 +333,41 @@ export function sanitizeAccount(rawAcc: PlayerAccount): PlayerAccount {
             quranCorrectClaimed: false,
           },
     ledger: rawLedger,
-    matchHistory: Array.isArray(rawAcc.matchHistory) ? rawAcc.matchHistory : [],
-    friends: Array.isArray(rawAcc.friends) ? rawAcc.friends : [],
+    matchHistory: safeMatchHistory,
+    friends: safeFriends,
+    soundEnabled: safeRaw.soundEnabled !== false,
+    vibrationEnabled: safeRaw.vibrationEnabled !== false,
+    localNotificationsEnabled: safeRaw.localNotificationsEnabled !== false,
+    soundPack: safeRaw.soundPack || 'cyber',
+    language: safeLanguage,
+    botDifficulty: safeRaw.botDifficulty || 'medium',
+    botPersona: safeRaw.botPersona || 'thinker',
+    ownedBorders: safeBorders,
+    unlockedBorders: safeBorders,
+    equippedBorder: safeEquippedBorder,
+    ownedThemes: safeThemes,
+    equippedTheme: safeEquippedTheme,
+    createdAt: Number(safeRaw.createdAt || now),
+    updatedAt: Number(safeRaw.updatedAt || now),
   };
 }
+
+export const sanitizeAccount = sanitizePlayerAccount;
 
 export function loadAllAccounts(): Record<string, PlayerAccount> {
   try {
     const raw = localStorage.getItem(ACCOUNTS_REGISTRY_KEY);
     if (!raw) return {};
-    return JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return {};
+    const sanitizedRegistry: Record<string, PlayerAccount> = {};
+    for (const [uid, acc] of Object.entries(parsed)) {
+      if (acc && typeof acc === 'object') {
+        const clean = sanitizePlayerAccount(acc as Partial<PlayerAccount>);
+        sanitizedRegistry[uid] = clean;
+      }
+    }
+    return sanitizedRegistry;
   } catch {
     return {};
   }
@@ -185,11 +386,30 @@ export function getActiveAccount(): PlayerAccount | null {
     const registry = loadAllAccounts();
     const activeUid = localStorage.getItem(ACTIVE_USER_KEY);
     if (activeUid && registry[activeUid]) {
-      const sanitized = sanitizeAccount(registry[activeUid]);
+      const sanitized = sanitizePlayerAccount(registry[activeUid]);
       registry[activeUid] = sanitized;
       saveAllAccounts(registry);
+      localStorage.setItem(ACTIVE_ACCOUNT_SNAPSHOT_KEY, JSON.stringify(sanitized));
       return sanitized;
     }
+
+    // Fallback: recover from active account snapshot if registry lookup missed
+    const snapshotRaw = localStorage.getItem(ACTIVE_ACCOUNT_SNAPSHOT_KEY);
+    if (snapshotRaw) {
+      const parsedSnap = JSON.parse(snapshotRaw);
+      if (parsedSnap && typeof parsedSnap === 'object' && parsedSnap.uid) {
+        const sanitized = sanitizePlayerAccount(parsedSnap);
+        registry[sanitized.uid] = sanitized;
+        saveAllAccounts(registry);
+        localStorage.setItem(ACTIVE_USER_KEY, sanitized.uid);
+        localStorage.setItem(
+          ACTIVE_ACCOUNT_SNAPSHOT_KEY,
+          JSON.stringify(sanitized)
+        );
+        return sanitized;
+      }
+    }
+
     return null;
   } catch {
     return null;
@@ -197,11 +417,22 @@ export function getActiveAccount(): PlayerAccount | null {
 }
 
 export function setActiveAccountUid(uid: string | null) {
-  if (!uid) {
-    localStorage.removeItem(ACTIVE_USER_KEY);
-  } else {
-    localStorage.setItem(ACTIVE_USER_KEY, uid);
-  }
+  try {
+    if (!uid) {
+      localStorage.removeItem(ACTIVE_USER_KEY);
+      localStorage.removeItem(ACTIVE_ACCOUNT_SNAPSHOT_KEY);
+    } else {
+      localStorage.setItem(ACTIVE_USER_KEY, uid);
+      const registry = loadAllAccounts();
+      if (registry[uid]) {
+        const sanitized = sanitizePlayerAccount(registry[uid]);
+        localStorage.setItem(
+          ACTIVE_ACCOUNT_SNAPSHOT_KEY,
+          JSON.stringify(sanitized)
+        );
+      }
+    }
+  } catch {}
 }
 
 export function generateUniquePlayerId(registry: Record<string, PlayerAccount>): string {
@@ -375,12 +606,27 @@ export function createNewPlayerAccount(params: {
     updatedAt: now,
   };
 
-  registry[uid] = newAccount;
+  const sanitizedNew = sanitizePlayerAccount({
+    ...newAccount,
+    ownedBorders: ['default_cyan'],
+    unlockedBorders: ['default_cyan'],
+    equippedBorder: 'default_cyan',
+    ownedThemes: ['midnight_cyan'],
+    equippedTheme: 'midnight_cyan',
+  });
+
+  registry[uid] = sanitizedNew;
   saveAllAccounts(registry);
   setActiveAccountUid(uid);
-  syncPlayerToCloud(newAccount).catch(() => {});
+  try {
+    localStorage.setItem(
+      ACTIVE_ACCOUNT_SNAPSHOT_KEY,
+      JSON.stringify(sanitizedNew)
+    );
+  } catch {}
+  syncPlayerToCloud(sanitizedNew).catch(() => {});
 
-  return { account: newAccount };
+  return { account: sanitizedNew };
 }
 
 export function loginPlayerAccount(
@@ -408,7 +654,7 @@ export function loginPlayerAccount(
     return { errorAr: 'كلمة المرور غير صحيحة، يرجى التأكد والمحاولة مجدداً.' };
   }
 
-  const sanitizedFound = sanitizeAccount(found);
+  const sanitizedFound = sanitizePlayerAccount(found);
   const today = getTodayDateStr();
   if (sanitizedFound.adsWatchedDate !== today) {
     sanitizedFound.adsWatchedDate = today;
@@ -418,6 +664,12 @@ export function loginPlayerAccount(
   registry[sanitizedFound.uid] = sanitizedFound;
   saveAllAccounts(registry);
   setActiveAccountUid(sanitizedFound.uid);
+  try {
+    localStorage.setItem(
+      ACTIVE_ACCOUNT_SNAPSHOT_KEY,
+      JSON.stringify(sanitizedFound)
+    );
+  } catch {}
   syncPlayerToCloud(sanitizedFound).catch(() => {});
 
   return { account: sanitizedFound };
@@ -427,7 +679,7 @@ export function persistUpdatedAccount(
   rawUpdated: PlayerAccount
 ): { account: PlayerAccount; newlyUnlockedTitles: string[] } {
   const registry = loadAllAccounts();
-  const updated = sanitizeAccount({ ...rawUpdated });
+  const updated = sanitizePlayerAccount({ ...rawUpdated });
 
   // Recompute level from XP
   const { currentRank } = computeLevelInfo(updated.xp);
@@ -480,6 +732,12 @@ export function persistUpdatedAccount(
   registry[updated.uid] = updated;
   saveAllAccounts(registry);
   setActiveAccountUid(updated.uid);
+  try {
+    localStorage.setItem(
+      ACTIVE_ACCOUNT_SNAPSHOT_KEY,
+      JSON.stringify(updated)
+    );
+  } catch {}
   syncPlayerToCloud(updated).catch(() => {});
 
   return { account: updated, newlyUnlockedTitles };

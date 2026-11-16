@@ -107,6 +107,51 @@ function isOfflineOrNetworkError(error: unknown): boolean {
   );
 }
 
+/**
+ * Recursively sanitizes a Firestore document payload before `setDoc` so no field is ever `undefined` or `NaN`.
+ * Replaces `undefined` with `""` (empty string) and `NaN` with `0`.
+ */
+export function cleanFirestoreData<T extends Record<string, any>>(raw: T): T {
+  const cleaned: Record<string, any> = {};
+  for (const [key, val] of Object.entries(raw || {})) {
+    if (val === undefined) {
+      cleaned[key] = '';
+    } else if (typeof val === 'number') {
+      cleaned[key] = Number.isNaN(val) ? 0 : val;
+    } else if (Array.isArray(val)) {
+      cleaned[key] = val.map(item =>
+        item === undefined ? '' : typeof item === 'number' && Number.isNaN(item) ? 0 : item
+      );
+    } else {
+      cleaned[key] = val;
+    }
+  }
+  return cleaned as T;
+}
+
+/**
+ * Sanitizes a partial update payload before `updateDoc` by stripping `undefined` keys
+ * and converting `NaN` numbers to `0` so Firestore never rejects an update.
+ */
+export function cleanFirestoreUpdateData<T extends Record<string, any>>(raw: T): T {
+  const cleaned: Record<string, any> = {};
+  for (const [key, val] of Object.entries(raw || {})) {
+    if (val === undefined) {
+      continue;
+    }
+    if (typeof val === 'number') {
+      cleaned[key] = Number.isNaN(val) ? 0 : val;
+    } else if (Array.isArray(val)) {
+      cleaned[key] = val.map(item =>
+        item === undefined ? '' : typeof item === 'number' && Number.isNaN(item) ? 0 : item
+      );
+    } else {
+      cleaned[key] = val;
+    }
+  }
+  return cleaned as T;
+}
+
 export function handleFirestoreError(
   error: unknown,
   operationType: OperationType,
@@ -134,8 +179,8 @@ export function handleFirestoreError(
     operationType,
     path,
   };
-  console.error('Firestore Error: ', JSON.stringify(errInfo));
-  throw new Error(JSON.stringify(errInfo));
+  // Log diagnostic info without throwing or disconnecting the app's network state
+  console.warn('Firestore Operation Diagnostic: ', JSON.stringify(errInfo));
 }
 
 // Validate connection on boot only when online
@@ -193,12 +238,11 @@ function runWithTimeout<T>(
 }
 
 /**
- * Lightweight Firestore connectivity check without any external `fetch` calls
- * (prevents Android WebView / Capacitor APK from hanging on blocked HTTP origin probes).
- * Relies solely on `navigator.onLine` + lightweight `getDocFromServer` on an allowed read path.
+ * Checks device internet status strictly via `navigator.onLine`.
+ * Never marks the app offline due to a Firestore document read/write failure.
  */
 export async function checkRealInternetAndFirebaseConnection(
-  timeoutMs = 4000
+  _timeoutMs = 4000
 ): Promise<boolean> {
   if (typeof navigator !== 'undefined' && !navigator.onLine) {
     setFirestoreOnlineMode(false);
@@ -206,20 +250,7 @@ export async function checkRealInternetAndFirebaseConnection(
   }
 
   setFirestoreOnlineMode(true);
-
-  const probe = await runWithTimeout(
-    getDocFromServer(doc(db, 'players', 'neurox_ping_check')),
-    timeoutMs
-  );
-
-  if (probe.ok) {
-    return true;
-  }
-  if (probe.timedOut) {
-    return false;
-  }
-  // If Firestore server responded with a non-network error (e.g., permission-denied), server is reachable
-  return !isOfflineOrNetworkError(probe.error);
+  return true;
 }
 
 export interface CloudStartupResult {
@@ -358,16 +389,19 @@ export async function bootstrapCloudStartup(
   const result = await runWithTimeout(syncWork(), maxTimeoutMs);
   onStage?.('done');
 
+  const browserOnline =
+    typeof navigator !== 'undefined' ? navigator.onLine : true;
+
   if (!result.ok) {
     return {
-      online: false,
+      online: browserOnline,
       cloudSynced: false,
       timedOut: result.timedOut,
     };
   }
 
   return {
-    online: result.value.reachable,
+    online: browserOnline,
     cloudSynced: result.value.synced,
     timedOut: false,
     accountPatch: result.value.accountPatch,
@@ -437,7 +471,7 @@ export async function syncPlayerToCloud(
       ? account.playerId
       : `#${Math.floor(1000000000 + Math.random() * 9000000000)}`;
 
-    const payload = {
+    const payload = cleanFirestoreData({
       uid: docId,
       playerId: existingSnap.exists()
         ? existingSnap.data().playerId || safePlayerId
@@ -445,50 +479,62 @@ export async function syncPlayerToCloud(
       username: safeUsername,
       countryCode: safeCountryCode,
       countryFlag: safeCountryFlag,
-      xp: Math.max(0, Math.min(1000000000, Math.floor(account.xp))),
-      level: Math.max(1, Math.min(6, Math.floor(account.level))),
-      coins: Math.max(0, Math.min(1000000000, Math.floor(account.coins))),
+      xp: Math.max(0, Math.min(1000000000, Math.floor(Number(account.xp) || 0))),
+      level: Math.max(1, Math.min(6, Math.floor(Number(account.level) || 1))),
+      coins: Math.max(0, Math.min(1000000000, Math.floor(Number(account.coins) || 0))),
       monthlyPoints: Math.max(
         0,
-        Math.min(1000000000, Math.floor(account.monthlyPoints))
+        Math.min(1000000000, Math.floor(Number(account.monthlyPoints) || 0))
       ),
-      rating: Math.max(0, Math.min(1000000000, Math.floor(account.rating))),
-      vipTier: account.vipTier,
+      rating: Math.max(0, Math.min(1000000000, Math.floor(Number(account.rating) || 1200))),
+      vipTier: account.vipTier || 'basic',
       fairPlayScore: Math.max(
         0,
-        Math.min(100, Math.floor(account.fairPlayScore))
+        Math.min(100, Math.floor(Number(account.fairPlayScore ?? 100)))
       ),
       onlineWins: Math.max(
         0,
-        Math.min(1000000000, Math.floor(account.onlineWins))
+        Math.min(1000000000, Math.floor(Number(account.onlineWins) || 0))
       ),
       totalMatches: Math.max(
         0,
-        Math.min(1000000000, Math.floor(account.totalMatches))
+        Math.min(1000000000, Math.floor(Number(account.totalMatches) || 0))
       ),
       isBanned: Boolean(account.isBanned),
       updatedAt: serverTimestamp(),
-    };
+    });
 
     if (!existingSnap.exists()) {
-      await setDoc(doc(db, 'players', docId), {
-        ...payload,
-        createdAt: serverTimestamp(),
-      });
+      await setDoc(
+        doc(db, 'players', docId),
+        cleanFirestoreData({
+          ...payload,
+          createdAt: serverTimestamp(),
+        })
+      );
     } else {
-      await updateDoc(doc(db, 'players', docId), payload);
+      await updateDoc(
+        doc(db, 'players', docId),
+        cleanFirestoreUpdateData(payload)
+      );
     }
 
     // Mirror into `users/{docId}` collection for real-time Owner Control Panel management
     try {
       const existingUserSnap = await getDoc(doc(db, 'users', docId));
       if (!existingUserSnap.exists()) {
-        await setDoc(doc(db, 'users', docId), {
-          ...payload,
-          createdAt: serverTimestamp(),
-        });
+        await setDoc(
+          doc(db, 'users', docId),
+          cleanFirestoreData({
+            ...payload,
+            createdAt: serverTimestamp(),
+          })
+        );
       } else {
-        await updateDoc(doc(db, 'users', docId), payload);
+        await updateDoc(
+          doc(db, 'users', docId),
+          cleanFirestoreUpdateData(payload)
+        );
       }
     } catch (err) {
       handleFirestoreError(err, OperationType.WRITE, userPath);
@@ -509,17 +555,20 @@ export async function syncPlayerToCloud(
         currentUser.email ||
         'player@neurox.gg'
       ).slice(0, 120);
-      const vaultPayload = {
+      const vaultPayload = cleanFirestoreData({
         uid: currentUser.uid,
         contactValue:
           safeContact.length >= 3 ? safeContact : 'player@neurox.gg',
         contactType: account.contactType === 'phone' ? 'phone' : 'email',
         updatedAt: serverTimestamp(),
-      };
+      });
       if (!vaultSnap.exists()) {
         await setDoc(doc(db, 'user_vaults', currentUser.uid), vaultPayload);
       } else {
-        await updateDoc(doc(db, 'user_vaults', currentUser.uid), vaultPayload);
+        await updateDoc(
+          doc(db, 'user_vaults', currentUser.uid),
+          cleanFirestoreUpdateData(vaultPayload)
+        );
       }
     } catch (error) {
       handleFirestoreError(error, OperationType.WRITE, vaultPath);
@@ -649,43 +698,83 @@ export async function createCloudPrivateRoom(
   customQuestionSeeds?: number[]
 ): Promise<boolean> {
   if (typeof navigator !== 'undefined' && !navigator.onLine) return false;
+  const cleanRoomCode = String(roomCode || '')
+    .replace(/[^a-zA-Z0-9_-]/g, '')
+    .slice(0, 16);
+  if (cleanRoomCode.length < 4) return false;
+
   const hostUid = getSafeDocUid(hostAccount);
-  const path = `rooms/${roomCode}`;
-  const cleanTargetId = normalizePlayerIdTag(targetPlayerId).slice(0, 32);
+  const path = `rooms/${cleanRoomCode}`;
+  const cleanTargetId = normalizePlayerIdTag(targetPlayerId || '').slice(0, 32);
+  const safeSeed = Math.max(0, Math.floor(Number(questionSeed) || 7));
   const unifiedSeeds = (
     customQuestionSeeds && customQuestionSeeds.length > 0
       ? customQuestionSeeds
-      : generateRoomQuestionSeeds(questionSeed, 25)
+      : generateRoomQuestionSeeds(safeSeed, 25)
   )
     .slice(0, 25)
     .map(n => Math.max(0, Math.floor(Number(n) || 0)));
 
+  const safeHostName =
+    (hostAccount.username || 'لاعب_الميدان').trim().slice(0, 32) ||
+    'لاعب_الميدان';
+  const safeHostFlag =
+    (hostAccount.countryFlag || '🇸🇦').trim().slice(0, 16) || '🇸🇦';
+  const safeHostPlayerId = (hostAccount.playerId || '#1000000000')
+    .trim()
+    .slice(0, 16);
+  const safeCategory =
+    (category || 'cocktail').trim().slice(0, 32) || 'cocktail';
+
+  // Sync player profile in background without blocking room creation
+  syncPlayerToCloud(hostAccount).catch(() => {});
+
+  const roomDocData = cleanFirestoreData({
+    roomCode: cleanRoomCode,
+    hostUid: hostUid || 'plr_host',
+    hostName: safeHostName,
+    hostFlag: safeHostFlag,
+    hostPlayerId: safeHostPlayerId,
+    guestUid: '',
+    guestName: '',
+    guestFlag: '',
+    guestPlayerId: '',
+    targetPlayerId: cleanTargetId || '',
+    category: safeCategory,
+    questionSeed: safeSeed,
+    questionSeeds: unifiedSeeds,
+    status: 'waiting',
+    hostScore: 0,
+    guestScore: 0,
+    hostAnsweredRound: 0,
+    guestAnsweredRound: 0,
+    hostReadyNextRound: false,
+    guestReadyNextRound: false,
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  });
+
   try {
-    await syncPlayerToCloud(hostAccount);
-    await setDoc(doc(db, 'rooms', roomCode), {
-      roomCode,
-      hostUid,
-      hostName: hostAccount.username.slice(0, 32),
-      hostFlag: hostAccount.countryFlag.slice(0, 16),
-      hostPlayerId: (hostAccount.playerId || '').slice(0, 16),
-      guestUid: '',
-      guestName: '',
-      guestFlag: '',
-      guestPlayerId: '',
-      targetPlayerId: cleanTargetId,
-      category: category.slice(0, 32),
-      questionSeed: Math.max(0, Math.floor(questionSeed)),
-      questionSeeds: unifiedSeeds,
-      status: 'waiting',
-      hostScore: 0,
-      guestScore: 0,
-      hostAnsweredRound: 0,
-      guestAnsweredRound: 0,
-      hostReadyNextRound: false,
-      guestReadyNextRound: false,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
+    const roomRef = doc(db, 'rooms', cleanRoomCode);
+    const existingSnap = await getDoc(roomRef).catch(() => null);
+    if (!existingSnap || !existingSnap.exists()) {
+      await setDoc(roomRef, roomDocData);
+    } else {
+      const existingData = existingSnap.data();
+      // If our own waiting room already exists, keep it active/waiting cleanly
+      if (
+        existingData.hostUid === hostUid &&
+        existingData.status === 'waiting'
+      ) {
+        await updateDoc(
+          roomRef,
+          cleanFirestoreUpdateData({
+            status: 'waiting',
+            updatedAt: serverTimestamp(),
+          })
+        );
+      }
+    }
     return true;
   } catch (error) {
     handleFirestoreError(error, OperationType.CREATE, path);
@@ -706,13 +795,45 @@ export async function joinCloudPrivateRoom(
   hostPlayerId: string;
   status: string;
 } | null> {
-  if (typeof navigator !== 'undefined' && !navigator.onLine) return null;
+  const cleanRoomCode = String(roomCode || '')
+    .replace(/[^a-zA-Z0-9_-]/g, '')
+    .slice(0, 16);
+  const fallbackSeed = cleanRoomCode
+    .split('')
+    .reduce((acc, ch) => acc * 31 + ch.charCodeAt(0), 7);
+  const fallbackResult = {
+    category: 'cocktail',
+    questionSeed: fallbackSeed,
+    questionSeeds: generateRoomQuestionSeeds(fallbackSeed, 25),
+    hostName: '',
+    hostFlag: '🇸🇦',
+    hostUid: '',
+    hostPlayerId: '',
+    status: 'waiting',
+  };
+
+  if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    return fallbackResult;
+  }
+
   const rawGuestUid = getSafeDocUid(guestAccount);
-  const path = `rooms/${roomCode}`;
+  const path = `rooms/${cleanRoomCode}`;
+
+  // Sync guest profile asynchronously without blocking room join
+  syncPlayerToCloud(guestAccount).catch(() => {});
+
   try {
-    await syncPlayerToCloud(guestAccount);
-    const snap = await getDoc(doc(db, 'rooms', roomCode));
-    if (!snap.exists()) return null;
+    const roomRef = doc(db, 'rooms', cleanRoomCode);
+    let snap = await getDoc(roomRef);
+    if (!snap.exists()) {
+      // Wait briefly in case host's room creation is still propagating to Firestore
+      await new Promise(r => setTimeout(r, 500));
+      snap = await getDoc(roomRef);
+    }
+    if (!snap.exists()) {
+      return fallbackResult;
+    }
+
     const data = snap.data();
 
     const isHostRejoiningOwnWaitingRoom =
@@ -723,28 +844,31 @@ export async function joinCloudPrivateRoom(
     if (data.status === 'waiting' && !isHostRejoiningOwnWaitingRoom) {
       const effectiveGuestUid =
         data.hostUid === rawGuestUid
-          ? `${rawGuestUid}_guest_${guestAccount.playerId.replace(/[^0-9]/g, '').slice(-4) || '2'}`.slice(
+          ? `${rawGuestUid}_guest_${(guestAccount.playerId || '').replace(/[^0-9]/g, '').slice(-4) || '2'}`.slice(
               0,
               120
             )
           : rawGuestUid;
 
-      await updateDoc(doc(db, 'rooms', roomCode), {
-        guestUid: effectiveGuestUid,
-        guestName: guestAccount.username.slice(0, 32),
-        guestFlag: guestAccount.countryFlag.slice(0, 16),
-        guestPlayerId: (guestAccount.playerId || '').slice(0, 16),
-        status: 'active',
-        updatedAt: serverTimestamp(),
-      });
+      await updateDoc(
+        roomRef,
+        cleanFirestoreUpdateData({
+          guestUid: effectiveGuestUid || 'plr_guest',
+          guestName: (guestAccount.username || 'منافس').trim().slice(0, 32) || 'منافس',
+          guestFlag: (guestAccount.countryFlag || '🇸🇦').trim().slice(0, 16) || '🇸🇦',
+          guestPlayerId: (guestAccount.playerId || '#1000000000').trim().slice(0, 16),
+          status: 'active',
+          updatedAt: serverTimestamp(),
+        })
+      );
     }
 
     return {
       category: String(data.category || 'cocktail'),
-      questionSeed: Number(data.questionSeed || 7),
+      questionSeed: Number(data.questionSeed || fallbackSeed),
       questionSeeds: Array.isArray(data.questionSeeds)
         ? data.questionSeeds.map((n: unknown) => Number(n) || 0)
-        : generateRoomQuestionSeeds(Number(data.questionSeed || 7), 25),
+        : generateRoomQuestionSeeds(Number(data.questionSeed || fallbackSeed), 25),
       hostName: String(data.hostName || 'المضيف'),
       hostFlag: String(data.hostFlag || '🇸🇦'),
       hostUid: String(data.hostUid || ''),
@@ -753,7 +877,7 @@ export async function joinCloudPrivateRoom(
     };
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, path);
-    return null;
+    return fallbackResult;
   }
 }
 
@@ -770,12 +894,17 @@ export async function updateCloudRoomState(
   }>
 ): Promise<void> {
   if (typeof navigator !== 'undefined' && !navigator.onLine) return;
-  const path = `rooms/${roomCode}`;
+  const cleanRoomCode = String(roomCode || '')
+    .replace(/[^a-zA-Z0-9_-]/g, '')
+    .slice(0, 16);
+  if (!cleanRoomCode) return;
+  const path = `rooms/${cleanRoomCode}`;
   try {
-    await updateDoc(doc(db, 'rooms', roomCode), {
+    const cleanedUpdates = cleanFirestoreUpdateData({
       ...updates,
       updatedAt: serverTimestamp(),
     });
+    await updateDoc(doc(db, 'rooms', cleanRoomCode), cleanedUpdates);
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, path);
   }
@@ -783,15 +912,22 @@ export async function updateCloudRoomState(
 
 export function subscribeToCloudRoom(
   roomCode: string,
-  onUpdate: (data: Record<string, unknown>) => void
+  onUpdate: (data: Record<string, unknown>) => void,
+  onMissing?: () => void
 ): Unsubscribe | null {
   if (typeof navigator !== 'undefined' && !navigator.onLine) return null;
-  const path = `rooms/${roomCode}`;
+  const cleanRoomCode = String(roomCode || '')
+    .replace(/[^a-zA-Z0-9_-]/g, '')
+    .slice(0, 16);
+  if (!cleanRoomCode) return null;
+  const path = `rooms/${cleanRoomCode}`;
   return onSnapshot(
-    doc(db, 'rooms', roomCode),
+    doc(db, 'rooms', cleanRoomCode),
     snap => {
       if (snap.exists()) {
         onUpdate(snap.data());
+      } else {
+        onMissing?.();
       }
     },
     error => {
@@ -1256,7 +1392,7 @@ export async function seedOwnerFirestoreUsers(
       const userRef = doc(db, 'users', safeId);
       const userSnap = await getDoc(userRef);
       if (!userSnap.exists()) {
-        const payload = {
+        const payload = cleanFirestoreData({
           uid: safeId,
           playerId: /^#[0-9]{10}$/.test(item.playerId)
             ? item.playerId
@@ -1282,7 +1418,7 @@ export async function seedOwnerFirestoreUsers(
           isBanned: Boolean(item.isBanned),
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
-        };
+        });
         await setDoc(userRef, payload);
         await setDoc(doc(db, 'players', safeId), payload);
       }
@@ -1505,12 +1641,15 @@ export async function ownerMutatePlayerInFirestore(
         const ref = doc(db, colName, safeId);
         const snap = await getDoc(ref);
         if (!snap.exists()) {
-          await setDoc(ref, {
-            ...firestorePayload,
-            createdAt: serverTimestamp(),
-          });
+          await setDoc(
+            ref,
+            cleanFirestoreData({
+              ...firestorePayload,
+              createdAt: serverTimestamp(),
+            })
+          );
         } else {
-          await updateDoc(ref, firestorePayload);
+          await updateDoc(ref, cleanFirestoreUpdateData(firestorePayload));
         }
       } catch (err) {
         handleFirestoreError(err, OperationType.WRITE, `${colName}/${safeId}`);

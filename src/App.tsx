@@ -14,12 +14,12 @@ import {
   loadHourlyAdConfig,
   loadPlaytimeSeconds,
   persistUpdatedAccount,
+  sanitizePlayerAccount,
   savePlaytimeSeconds,
   setActiveAccountUid,
   updatePlayerProfileIdentity,
 } from './services/storage';
 import {
-  checkRealInternetAndFirebaseConnection,
   createCloudPrivateRoom,
   joinCloudPrivateRoom,
   setFirestoreOnlineMode,
@@ -226,9 +226,10 @@ type ActiveTab =
 
 export default function App() {
   const [showSplash, setShowSplash] = useState<boolean>(true);
-  const [account, setAccount] = useState<PlayerAccount | null>(() =>
-    getActiveAccount()
-  );
+  const [account, setAccount] = useState<PlayerAccount | null>(() => {
+    const active = getActiveAccount();
+    return active ? sanitizePlayerAccount(active) : null;
+  });
   const [activeTab, setActiveTab] = useState<ActiveTab>('arena');
 
   // Real-time Network Connectivity State (Online vs Offline-only enforcement)
@@ -314,11 +315,11 @@ export default function App() {
   useEffect(() => {
     if (!account || !isOnline) return;
     const unsub = subscribeToMyCloudProfileUpdates(account, remotePatch => {
-      const nextAcc: PlayerAccount = {
+      const nextAcc: PlayerAccount = sanitizePlayerAccount({
         ...account,
         ...remotePatch,
         updatedAt: Date.now(),
-      };
+      });
       const res = persistUpdatedAccount(nextAcc);
       setAccount({ ...res.account });
       if (remotePatch.vipTier && remotePatch.vipTier !== account.vipTier) {
@@ -416,12 +417,14 @@ export default function App() {
     return () => window.removeEventListener('popstate', handlePopState);
   }, []);
 
-  // Monitor Internet Connectivity via navigator.onLine events + lightweight Firestore reachability probe:
-  // When offline, immediately disable Firestore network, terminate any active online/room match,
-  // lock all online modes/tabs ('online', 'room', 'friends', 'store', 'leaderboard'),
-  // and keep only offline modes ('solo' & 'local') open.
+  // Monitor Internet Connectivity strictly via browser navigator.onLine / window 'online' & 'offline' events:
+  // Never switch isOnline to false due to Firestore read/write errors or slow queries!
+  // isOnline becomes false ONLY when window 'offline' fires or navigator.onLine === false.
   useEffect(() => {
     const applyOfflineLockdown = () => {
+      if (typeof navigator !== 'undefined' && navigator.onLine) {
+        return;
+      }
       setFirestoreOnlineMode(false);
       const wasOnline = isOnlineRef.current;
       isOnlineRef.current = false;
@@ -455,54 +458,31 @@ export default function App() {
 
     const applyOnlineRecovery = () => {
       setFirestoreOnlineMode(true);
-      if (isOnlineRef.current) return;
+      const wasOnline = isOnlineRef.current;
       isOnlineRef.current = true;
       setIsOnline(true);
       setSelectedMode('online');
-      if (!showSplashRef.current) {
+      if (!wasOnline && !showSplashRef.current) {
         showToast(
           '🌐 عاد الاتصال بالإنترنت! تم فتح جميع أطوار الأونلاين والأصدقاء والبطولة السحابية.'
         );
       }
     };
 
-    const runHeartbeat = async () => {
-      if (showSplashRef.current) return;
-      if (typeof navigator !== 'undefined' && !navigator.onLine) {
-        applyOfflineLockdown();
-        return;
-      }
-      const reachable = await checkRealInternetAndFirebaseConnection(4000);
-      if (!reachable) {
-        applyOfflineLockdown();
-      } else if (!isOnlineRef.current) {
-        applyOnlineRecovery();
-      }
-    };
-
-    const handleBrowserOnline = () => {
-      setFirestoreOnlineMode(true);
-      if (showSplashRef.current) {
-        isOnlineRef.current = true;
-        setIsOnline(true);
-      } else {
-        runHeartbeat();
-      }
-    };
-
-    window.addEventListener('online', handleBrowserOnline);
+    window.addEventListener('online', applyOnlineRecovery);
     window.addEventListener('offline', applyOfflineLockdown);
 
     if (typeof navigator !== 'undefined' && !navigator.onLine) {
       applyOfflineLockdown();
+    } else {
+      setFirestoreOnlineMode(true);
+      isOnlineRef.current = true;
+      setIsOnline(true);
     }
 
-    const hbInterval = window.setInterval(runHeartbeat, 6000);
-
     return () => {
-      window.removeEventListener('online', handleBrowserOnline);
+      window.removeEventListener('online', applyOnlineRecovery);
       window.removeEventListener('offline', applyOfflineLockdown);
-      window.clearInterval(hbInterval);
     };
   }, []);
 
@@ -517,7 +497,9 @@ export default function App() {
     updated: PlayerAccount,
     customToast?: string
   ) => {
-    const res = persistUpdatedAccount(updated);
+    const safeUpdated = sanitizePlayerAccount(updated);
+    setActiveAccountUid(safeUpdated.uid);
+    const res = persistUpdatedAccount(safeUpdated);
     setAccount({ ...res.account });
     if (res.newlyUnlockedTitles.length > 0) {
       showToast(
@@ -572,7 +554,7 @@ export default function App() {
       showToast('🚫 تم حظر هذا الحساب من اللعب الأونلاين وإنشاء الغرف.');
       return;
     }
-    if (!isOnline) {
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
       soundFX.playWrong();
       showToast('⚠️ إنشاء الغرف الخاصة يتطلب اتصالاً بالإنترنت!');
       return;
@@ -583,17 +565,19 @@ export default function App() {
     const seed = code
       .split('')
       .reduce((acc, ch) => acc * 31 + ch.charCodeAt(0), 7);
-    await createCloudPrivateRoom(code, account, roomCategory, seed).catch(
+
+    // Create room in Firestore in background without blocking or disconnecting if slow
+    createCloudPrivateRoom(code, account, roomCategory, seed, '').catch(
       () => {}
     );
     broadcastChallengeInvite({
       id: `inv_${code}_${Date.now()}`,
       roomCode: code,
       category: roomCategory,
-      senderUid: account.uid,
-      senderPlayerId: account.playerId,
-      senderName: account.username,
-      senderFlag: account.countryFlag,
+      senderUid: account.uid || '',
+      senderPlayerId: account.playerId || '',
+      senderName: account.username || 'لاعب',
+      senderFlag: account.countryFlag || '🇸🇦',
       timestamp: Date.now(),
       read: false,
     });
@@ -606,7 +590,7 @@ export default function App() {
       showToast('🚫 تم حظر هذا الحساب من اللعب الأونلاين والانضمام للغرف.');
       return;
     }
-    if (!isOnline) {
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
       soundFX.playWrong();
       showToast('⚠️ الانضمام للغرف الخاصة يتطلب اتصالاً بالإنترنت!');
       return;
@@ -618,30 +602,42 @@ export default function App() {
       return;
     }
     soundFX.playCorrect();
-    const cloudRoom = await joinCloudPrivateRoom(clean, account).catch(
-      () => null
-    );
-    const isJoiningAsHost =
-      cloudRoom &&
-      ((cloudRoom.hostPlayerId && cloudRoom.hostPlayerId === account.playerId) ||
-        cloudRoom.hostName === account.username);
     setRoomModalOpen(false);
     setNotifDrawerOpen(false);
     setActiveIncomingBanner(null);
+
+    // Open room screen immediately in MatchArena while joining/syncing in Firestore
     setActiveMatch({
       mode: 'room',
-      category: (cloudRoom?.category as CategoryId) || roomCategory,
+      category: roomCategory,
       roomCode: clean,
-      customOpponentName: isJoiningAsHost
-        ? undefined
-        : cloudRoom?.hostName || undefined,
-      customOpponentFlag: isJoiningAsHost
-        ? undefined
-        : cloudRoom?.hostFlag || undefined,
-      customOpponentPlayerId: isJoiningAsHost
-        ? undefined
-        : cloudRoom?.hostPlayerId || undefined,
     });
+
+    joinCloudPrivateRoom(clean, account)
+      .then(cloudRoom => {
+        if (!cloudRoom) return;
+        const isJoiningAsHost =
+          (cloudRoom.hostPlayerId &&
+            cloudRoom.hostPlayerId === account.playerId) ||
+          cloudRoom.hostName === account.username;
+        setActiveMatch(prev => {
+          if (!prev || prev.roomCode !== clean) return prev;
+          return {
+            ...prev,
+            category: (cloudRoom.category as CategoryId) || prev.category,
+            customOpponentName: isJoiningAsHost
+              ? prev.customOpponentName
+              : cloudRoom.hostName || prev.customOpponentName,
+            customOpponentFlag: isJoiningAsHost
+              ? prev.customOpponentFlag
+              : cloudRoom.hostFlag || prev.customOpponentFlag,
+            customOpponentPlayerId: isJoiningAsHost
+              ? prev.customOpponentPlayerId
+              : cloudRoom.hostPlayerId || prev.customOpponentPlayerId,
+          };
+        });
+      })
+      .catch(() => {});
   };
 
   const handleAcceptChallengeNotification = async (
@@ -658,25 +654,24 @@ export default function App() {
       return next;
     });
 
-    if (!isOnline) {
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
       soundFX.playWrong();
       showToast('⚠️ الانضمام لدعوة التحدي يتطلب اتصالاً بالإنترنت!');
       return;
     }
 
     soundFX.playCorrect();
-    const cloudRoom = await joinCloudPrivateRoom(invite.roomCode, account).catch(
-      () => null
-    );
+    // Immediately open MatchArena so the player is never blocked if Firestore is slow
     setActiveMatch({
       mode: 'room',
-      category:
-        (cloudRoom?.category as CategoryId) || invite.category || 'cocktail',
+      category: invite.category || 'cocktail',
       roomCode: invite.roomCode,
-      customOpponentName: cloudRoom?.hostName || invite.senderName,
-      customOpponentFlag: cloudRoom?.hostFlag || invite.senderFlag,
-      customOpponentPlayerId: invite.senderPlayerId,
+      customOpponentName: invite.senderName || 'صديق',
+      customOpponentFlag: invite.senderFlag || '🇸🇦',
+      customOpponentPlayerId: invite.senderPlayerId || '',
     });
+
+    joinCloudPrivateRoom(invite.roomCode, account).catch(() => {});
   };
 
   // Real-time Incoming Challenge Listeners (Firestore Waiting Rooms + Cross-Tab BroadcastChannel)
@@ -701,11 +696,11 @@ export default function App() {
       account,
       (roomCode, hostUid, hostName, hostFlag, category, hostPlayerId) => {
         // Check if this challenger is already in friends list or a new challenger
-        const matchedFriend = account.friends.find(
+        const matchedFriend = (account.friends || []).find(
           f =>
             f.uid === hostUid ||
             (hostPlayerId && f.playerId === hostPlayerId) ||
-            f.username.toLowerCase() === hostName.toLowerCase()
+            (f.username || '').toLowerCase() === hostName.toLowerCase()
         );
         const invite: ChallengeNotificationItem = {
           id: `cloud_inv_${roomCode}_${Date.now()}`,
@@ -751,7 +746,7 @@ export default function App() {
 
     window.setTimeout(() => {
       const testCode = Math.floor(1000 + Math.random() * 9000).toString();
-      const sampleFriend = account.friends[0];
+      const sampleFriend = (account.friends || [])[0];
       const testInvite: ChallengeNotificationItem = {
         id: `test_inv_${Date.now()}`,
         roomCode: testCode,
@@ -778,7 +773,7 @@ export default function App() {
 
   const handleChallengeFriend = async (friend: FriendItem) => {
     if (!account) return;
-    if (!isOnline) {
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
       soundFX.playWrong();
       showToast('⚠️ تحدي الأصدقاء عبر الإنترنت يتطلب اتصالاً بالشبكة!');
       return;
@@ -787,38 +782,46 @@ export default function App() {
     const seed = code
       .split('')
       .reduce((acc, ch) => acc * 31 + ch.charCodeAt(0), 7);
-    await createCloudPrivateRoom(
+    const safeTargetId = friend?.playerId || '';
+    const safeFriendName = friend?.username || 'صديق';
+    const safeFriendFlag = friend?.countryFlag || '🇸🇦';
+
+    // Immediately open MatchArena in waiting room mode so the player is never blocked or kicked out
+    setActiveMatch({
+      mode: 'room',
+      category: 'cocktail',
+      roomCode: code,
+      customOpponentName: safeFriendName,
+      customOpponentFlag: safeFriendFlag,
+      customOpponentPlayerId: safeTargetId,
+    });
+
+    showToast(
+      `⚔️ تم فتح غرفة التحدي #${code} وإرسال تنبيه فوري إلى ${safeFriendName} (${safeTargetId})!`
+    );
+
+    createCloudPrivateRoom(
       code,
       account,
       'cocktail',
       seed,
-      friend.playerId
+      safeTargetId
     ).catch(() => {});
+
     broadcastChallengeInvite(
       {
         id: `inv_${code}_${Date.now()}`,
         roomCode: code,
         category: 'cocktail',
-        senderUid: account.uid,
-        senderPlayerId: account.playerId,
-        senderName: account.username,
-        senderFlag: account.countryFlag,
+        senderUid: account.uid || '',
+        senderPlayerId: account.playerId || '',
+        senderName: account.username || 'لاعب',
+        senderFlag: account.countryFlag || '🇸🇦',
         timestamp: Date.now(),
         read: false,
       },
-      friend.playerId
+      safeTargetId
     );
-    showToast(
-      `⚔️ تم فتح غرفة التحدي #${code} وإرسال تنبيه فوري إلى ${friend.username} (${friend.playerId})!`
-    );
-    setActiveMatch({
-      mode: 'room',
-      category: 'cocktail',
-      roomCode: code,
-      customOpponentName: friend.username,
-      customOpponentFlag: friend.countryFlag,
-      customOpponentPlayerId: friend.playerId,
-    });
   };
 
   // 1. Splash Screen (Real Firebase sync when online, instant local launch when offline)
@@ -827,30 +830,31 @@ export default function App() {
       <SplashScreen
         existingAccount={account}
         onFinish={result => {
-          if (result) {
-            isOnlineRef.current = result.isOnline;
-            setIsOnline(result.isOnline);
-            if (!result.isOnline) {
-              setSelectedMode(prev =>
-                prev === 'online' || prev === 'room' ? 'solo' : prev
-              );
-              setActiveTab(prev =>
-                prev === 'friends' || prev === 'leaderboard' || prev === 'store'
-                  ? 'arena'
-                  : prev
-              );
-            } else {
-              setSelectedMode(prev => (prev === 'solo' ? 'online' : prev));
-            }
-            if (result.accountPatch && account) {
-              const merged: PlayerAccount = {
-                ...account,
-                ...result.accountPatch,
-                updatedAt: Date.now(),
-              };
-              const res = persistUpdatedAccount(merged);
-              setAccount({ ...res.account });
-            }
+          const browserOnline =
+            typeof navigator !== 'undefined' ? navigator.onLine : true;
+          isOnlineRef.current = browserOnline;
+          setIsOnline(browserOnline);
+          if (!browserOnline) {
+            setSelectedMode(prev =>
+              prev === 'online' || prev === 'room' ? 'solo' : prev
+            );
+            setActiveTab(prev =>
+              prev === 'friends' || prev === 'leaderboard' || prev === 'store'
+                ? 'arena'
+                : prev
+            );
+          } else {
+            setSelectedMode(prev => (prev === 'solo' ? 'online' : prev));
+          }
+          if (result?.accountPatch && account) {
+            const merged = sanitizePlayerAccount({
+              ...account,
+              ...result.accountPatch,
+              updatedAt: Date.now(),
+            });
+            setActiveAccountUid(merged.uid);
+            const res = persistUpdatedAccount(merged);
+            setAccount({ ...res.account });
           }
           showSplashRef.current = false;
           setShowSplash(false);
@@ -864,9 +868,12 @@ export default function App() {
     return (
       <AuthScreen
         onSuccess={loggedInAccount => {
-          setAccount(loggedInAccount);
+          const safeAcc = sanitizePlayerAccount(loggedInAccount);
+          setActiveAccountUid(safeAcc.uid);
+          const persisted = persistUpdatedAccount(safeAcc);
+          setAccount({ ...persisted.account });
           showToast(
-            `مرحباً بك في الساحة يا ${loggedInAccount.username} ${loggedInAccount.countryFlag}!`
+            `مرحباً بك في الساحة يا ${persisted.account.username} ${persisted.account.countryFlag}!`
           );
         }}
       />
