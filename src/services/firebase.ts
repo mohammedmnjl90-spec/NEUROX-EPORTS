@@ -242,11 +242,12 @@ function runWithTimeout<T>(
 }
 
 /**
- * Checks device internet status strictly via `navigator.onLine`.
- * Never marks the app offline due to a Firestore document read/write failure.
+ * Verifies real internet AND live Firebase Firestore connectivity.
+ * In Android WebView, `navigator.onLine` alone is not enough, so this performs
+ * a lightweight live server check (`getDocFromServer`) with a strict timeout.
  */
 export async function checkRealInternetAndFirebaseConnection(
-  _timeoutMs = 4000
+  timeoutMs = 2500
 ): Promise<boolean> {
   if (typeof navigator !== 'undefined' && !navigator.onLine) {
     setFirestoreOnlineMode(false);
@@ -254,6 +255,20 @@ export async function checkRealInternetAndFirebaseConnection(
   }
 
   setFirestoreOnlineMode(true);
+  const pingResult = await runWithTimeout(
+    getDocFromServer(doc(db, 'players', 'neurox_ping_check')),
+    timeoutMs
+  );
+
+  if (pingResult.ok) {
+    return true;
+  }
+
+  if (pingResult.timedOut || isOfflineOrNetworkError(pingResult.error)) {
+    return false;
+  }
+
+  // Server responded with a non-network error (e.g. permission/not-found), meaning internet & Firebase are reachable
   return true;
 }
 
@@ -405,7 +420,7 @@ export async function bootstrapCloudStartup(
   }
 
   return {
-    online: browserOnline,
+    online: browserOnline && result.value.reachable,
     cloudSynced: result.value.synced,
     timedOut: false,
     accountPatch: result.value.accountPatch,
@@ -445,11 +460,11 @@ export function subscribeToAuthChanges(
   return onAuthStateChanged(auth, cb);
 }
 
-// Sanitize a document ID so it strictly matches ^[a-zA-Z0-9_\-]+$
-function getSafeDocUid(account: PlayerAccount): string {
+// Sanitize a document ID so it strictly matches ^[a-zA-Z0-9_\-]+$ and matches account.uid
+export function getSafeDocUid(account: PlayerAccount): string {
   const raw =
-    auth.currentUser?.uid ||
     account.uid ||
+    auth.currentUser?.uid ||
     account.playerId.replace('#', 'plr_');
   return raw.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120) || 'plr_default';
 }
@@ -693,6 +708,10 @@ function normalizePlayerIdTag(id: string): string {
   return trimmed.startsWith('#') ? trimmed : `#${trimmed}`;
 }
 
+function getRoomCollectionName(roomCode: string): 'global_matchmaking' | 'rooms' {
+  return roomCode.startsWith('gmm_') ? 'global_matchmaking' : 'rooms';
+}
+
 export async function createCloudPrivateRoom(
   roomCode: string,
   hostAccount: PlayerAccount,
@@ -704,11 +723,12 @@ export async function createCloudPrivateRoom(
   if (typeof navigator !== 'undefined' && !navigator.onLine) return false;
   const cleanRoomCode = String(roomCode || '')
     .replace(/[^a-zA-Z0-9_-]/g, '')
-    .slice(0, 16);
+    .slice(0, 32);
   if (cleanRoomCode.length < 4) return false;
 
+  const colName = getRoomCollectionName(cleanRoomCode);
   const hostUid = getSafeDocUid(hostAccount);
-  const path = `rooms/${cleanRoomCode}`;
+  const path = `${colName}/${cleanRoomCode}`;
   const cleanTargetId =
     targetPlayerId === '__online_matchmaking__'
       ? '__online_matchmaking__'
@@ -747,9 +767,10 @@ export async function createCloudPrivateRoom(
   // Sync player profile in background without blocking room creation
   syncPlayerToCloud(hostAccount).catch(() => {});
 
+  const effectiveHostUid = hostUid || 'plr_host';
   const roomDocData = cleanFirestoreData({
     roomCode: cleanRoomCode,
-    hostUid: hostUid || 'plr_host',
+    hostUid: effectiveHostUid,
     hostName: safeHostName,
     hostFlag: safeHostFlag,
     hostPlayerId: safeHostPlayerId,
@@ -757,6 +778,7 @@ export async function createCloudPrivateRoom(
     guestName: '',
     guestFlag: '',
     guestPlayerId: '',
+    activeTurnUid: effectiveHostUid,
     targetPlayerId: cleanTargetId || '',
     category: safeCategory,
     questionSeed: safeSeed,
@@ -778,7 +800,7 @@ export async function createCloudPrivateRoom(
   });
 
   try {
-    const roomRef = doc(db, 'rooms', cleanRoomCode);
+    const roomRef = doc(db, colName, cleanRoomCode);
     const existingSnap = await getDoc(roomRef).catch(() => null);
     if (!existingSnap || !existingSnap.exists()) {
       await setDoc(roomRef, roomDocData);
@@ -786,13 +808,14 @@ export async function createCloudPrivateRoom(
       const existingData = existingSnap.data();
       // If our own waiting room already exists, keep it active/waiting cleanly
       if (
-        existingData.hostUid === hostUid &&
+        existingData.hostUid === effectiveHostUid &&
         existingData.status === 'waiting'
       ) {
         await updateDoc(
           roomRef,
           cleanFirestoreUpdateData({
             status: 'waiting',
+            activeTurnUid: effectiveHostUid,
             updatedAt: serverTimestamp(),
           })
         );
@@ -818,11 +841,14 @@ export async function joinCloudPrivateRoom(
   hostFlag: string;
   hostUid: string;
   hostPlayerId: string;
+  guestUid: string;
+  activeTurnUid: string;
   status: string;
 } | null> {
   const cleanRoomCode = String(roomCode || '')
     .replace(/[^a-zA-Z0-9_-]/g, '')
-    .slice(0, 16);
+    .slice(0, 32);
+  const colName = getRoomCollectionName(cleanRoomCode);
   const fallbackSeed = cleanRoomCode
     .split('')
     .reduce((acc, ch) => acc * 31 + ch.charCodeAt(0), 7);
@@ -844,6 +870,8 @@ export async function joinCloudPrivateRoom(
     hostFlag: '🇸🇦',
     hostUid: '',
     hostPlayerId: '',
+    guestUid: '',
+    activeTurnUid: '',
     status: 'waiting',
   };
 
@@ -852,13 +880,13 @@ export async function joinCloudPrivateRoom(
   }
 
   const rawGuestUid = getSafeDocUid(guestAccount);
-  const path = `rooms/${cleanRoomCode}`;
+  const path = `${colName}/${cleanRoomCode}`;
 
   // Sync guest profile asynchronously without blocking room join
   syncPlayerToCloud(guestAccount).catch(() => {});
 
   try {
-    const roomRef = doc(db, 'rooms', cleanRoomCode);
+    const roomRef = doc(db, colName, cleanRoomCode);
     let snap = await getDoc(roomRef);
     if (!snap.exists()) {
       // Wait briefly in case host's room creation is still propagating to Firestore
@@ -876,6 +904,9 @@ export async function joinCloudPrivateRoom(
       (data.hostPlayerId || '') === (guestAccount.playerId || '') &&
       data.hostName === guestAccount.username;
 
+    let assignedGuestUid = String(data.guestUid || '');
+    const initialTurnUid = String(data.activeTurnUid || data.hostUid || '');
+
     if (data.status === 'waiting' && !isHostRejoiningOwnWaitingRoom) {
       const effectiveGuestUid =
         data.hostUid === rawGuestUid
@@ -885,13 +916,16 @@ export async function joinCloudPrivateRoom(
             )
           : rawGuestUid;
 
+      assignedGuestUid = effectiveGuestUid || 'plr_guest';
+
       await updateDoc(
         roomRef,
         cleanFirestoreUpdateData({
-          guestUid: effectiveGuestUid || 'plr_guest',
+          guestUid: assignedGuestUid,
           guestName: (guestAccount.username || 'منافس').trim().slice(0, 32) || 'منافس',
           guestFlag: (guestAccount.countryFlag || '🇸🇦').trim().slice(0, 16) || '🇸🇦',
           guestPlayerId: (guestAccount.playerId || '#1000000000').trim().slice(0, 16),
+          activeTurnUid: initialTurnUid,
           status: 'active',
           updatedAt: serverTimestamp(),
         })
@@ -918,6 +952,8 @@ export async function joinCloudPrivateRoom(
       hostFlag: String(data.hostFlag || '🇸🇦'),
       hostUid: String(data.hostUid || ''),
       hostPlayerId: String(data.hostPlayerId || ''),
+      guestUid: assignedGuestUid,
+      activeTurnUid: initialTurnUid,
       status: isHostRejoiningOwnWaitingRoom ? String(data.status || 'waiting') : 'active',
     };
   } catch (error) {
@@ -931,6 +967,7 @@ export async function updateCloudRoomState(
   updates: Partial<{
     currentRound: number;
     questionIds: string[];
+    activeTurnUid: string;
     hostScore: number;
     guestScore: number;
     hostSelectedOption: number;
@@ -946,51 +983,55 @@ export async function updateCloudRoomState(
   if (typeof navigator !== 'undefined' && !navigator.onLine) return;
   const cleanRoomCode = String(roomCode || '')
     .replace(/[^a-zA-Z0-9_-]/g, '')
-    .slice(0, 16);
+    .slice(0, 32);
   if (!cleanRoomCode) return;
-  const path = `rooms/${cleanRoomCode}`;
+  const colName = getRoomCollectionName(cleanRoomCode);
+  const path = `${colName}/${cleanRoomCode}`;
   try {
     const cleanedUpdates = cleanFirestoreUpdateData({
       ...updates,
       updatedAt: serverTimestamp(),
     });
-    await updateDoc(doc(db, 'rooms', cleanRoomCode), cleanedUpdates);
+    await updateDoc(doc(db, colName, cleanRoomCode), cleanedUpdates);
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, path);
   }
 }
 
 /**
- * Attempts to match two real online players in `mode === 'online'` via Firestore `rooms`
- * before falling back to AI Bot if no human opponent is currently searching.
+ * Real-time human-only online matchmaking via Firestore `global_matchmaking` collection.
+ * Forces category to `'cocktail'` (comprehensive general quiz) so any two online players
+ * searching from different devices are matched into the same active room without any bots.
  */
 export async function findOrCreateOnlineMatchmakingRoom(
   playerAccount: PlayerAccount,
-  category: CategoryId
+  _category?: CategoryId
 ): Promise<{
   role: 'host' | 'guest';
   roomCode: string;
   hostName?: string;
   hostFlag?: string;
   hostPlayerId?: string;
+  hostUid?: string;
+  guestUid?: string;
+  activeTurnUid?: string;
 } | null> {
   if (typeof navigator !== 'undefined' && !navigator.onLine) return null;
   const mySafeUid = getSafeDocUid(playerAccount);
   const myPid = normalizePlayerIdTag(playerAccount.playerId);
+  const unifiedOnlineCategory: CategoryId = 'cocktail';
 
   try {
     const q = query(
-      collection(db, 'rooms'),
+      collection(db, 'global_matchmaking'),
       where('status', '==', 'waiting'),
-      limit(20)
+      limit(25)
     );
     const snap = await getDocs(q);
     const now = Date.now();
 
     for (const d of snap.docs) {
       const data = d.data();
-      const targetId = String(data.targetPlayerId || '');
-      const rCat = String(data.category || 'cocktail');
       const hUid = String(data.hostUid || '');
       const hPid = normalizePlayerIdTag(String(data.hostPlayerId || ''));
       const rawCreated = data.createdAt || data.updatedAt;
@@ -999,12 +1040,11 @@ export async function findOrCreateOnlineMatchmakingRoom(
           ? rawCreated.toMillis()
           : now;
 
+      // Match with any waiting real human player (created within the last 5 minutes)
       if (
-        targetId === '__online_matchmaking__' &&
-        rCat === category &&
         hUid !== mySafeUid &&
         hPid !== myPid &&
-        now - createdMs <= 15000
+        now - createdMs <= 5 * 60 * 1000
       ) {
         const joined = await joinCloudPrivateRoom(d.id, playerAccount);
         if (joined && joined.status === 'active') {
@@ -1014,26 +1054,31 @@ export async function findOrCreateOnlineMatchmakingRoom(
             hostName: joined.hostName,
             hostFlag: joined.hostFlag,
             hostPlayerId: joined.hostPlayerId,
+            hostUid: joined.hostUid,
+            guestUid: joined.guestUid,
+            activeTurnUid: joined.activeTurnUid,
           };
         }
       }
     }
 
-    const mmCode = `mm_${Math.floor(1000 + Math.random() * 9000)}`;
-    const seed = mmCode
+    const gmmCode = `gmm_${Math.floor(100000 + Math.random() * 900000)}`;
+    const seed = gmmCode
       .split('')
       .reduce((acc, ch) => acc * 31 + ch.charCodeAt(0), 7);
     const created = await createCloudPrivateRoom(
-      mmCode,
+      gmmCode,
       playerAccount,
-      category,
+      unifiedOnlineCategory,
       seed,
       '__online_matchmaking__'
     );
     if (created) {
       return {
         role: 'host',
-        roomCode: mmCode,
+        roomCode: gmmCode,
+        hostUid: mySafeUid,
+        activeTurnUid: mySafeUid,
       };
     }
     return null;
@@ -1050,12 +1095,13 @@ export function subscribeToCloudRoom(
   if (typeof navigator !== 'undefined' && !navigator.onLine) return null;
   const cleanRoomCode = String(roomCode || '')
     .replace(/[^a-zA-Z0-9_-]/g, '')
-    .slice(0, 16);
+    .slice(0, 32);
   if (!cleanRoomCode) return null;
-  const path = `rooms/${cleanRoomCode}`;
+  const colName = getRoomCollectionName(cleanRoomCode);
+  const path = `${colName}/${cleanRoomCode}`;
   try {
     return onSnapshot(
-      doc(db, 'rooms', cleanRoomCode),
+      doc(db, colName, cleanRoomCode),
       snap => {
         if (snap.exists()) {
           onUpdate(snap.data());

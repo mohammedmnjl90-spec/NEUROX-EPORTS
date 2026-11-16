@@ -20,6 +20,7 @@ import {
   updatePlayerProfileIdentity,
 } from './services/storage';
 import {
+  checkRealInternetAndFirebaseConnection,
   createCloudPrivateRoom,
   joinCloudPrivateRoom,
   respondToCloudFriendRequest,
@@ -520,26 +521,27 @@ function AppContent() {
     return () => window.removeEventListener('popstate', handlePopState);
   }, []);
 
-  // Monitor Internet Connectivity strictly via browser navigator.onLine / window 'online' & 'offline' events:
-  // Never switch isOnline to false due to Firestore read/write errors or slow queries!
-  // isOnline becomes false ONLY when window 'offline' fires or navigator.onLine === false.
+  // Continuous 3-Second Real Connectivity & Firebase Monitor (for Android WebView & Browsers):
+  // Checks both `navigator.onLine` and real Firebase Firestore reachability every 3 seconds.
+  // When offline (`isOnline === false`): forces `selectedMode` to `'solo'`, closes all modals/drawers,
+  // immediately exits any active `'online'` or `'room'` match, and locks all cloud tabs/buttons.
   useEffect(() => {
+    let isChecking = false;
+
     const applyOfflineLockdown = () => {
-      if (typeof navigator !== 'undefined' && navigator.onLine) {
-        return;
-      }
       setFirestoreOnlineMode(false);
       const wasOnline = isOnlineRef.current;
       isOnlineRef.current = false;
       setIsOnline(false);
-      setSelectedMode(prev => (prev === 'online' || prev === 'room' ? 'solo' : prev));
-      setActiveTab(prev =>
-        prev === 'friends' || prev === 'leaderboard' || prev === 'store'
-          ? 'arena'
-          : prev
+      setSelectedMode(prev =>
+        prev === 'online' || prev === 'room' ? 'solo' : prev
       );
+      setActiveTab('arena');
       setRoomModalOpen(false);
+      setNotifDrawerOpen(false);
       setActiveIncomingBanner(null);
+      setActiveFriendRequestBanner(null);
+      setIsEditingHomeProfile(false);
 
       const runningMatch = activeMatchRef.current;
       if (
@@ -554,7 +556,7 @@ function AppContent() {
         );
       } else if (wasOnline && !showSplashRef.current) {
         showToast(
-          '📡 لا يوجد اتصال بالإنترنت: تم تفعيل وضع الأوفلاين فقط (الفردي والمحلي) وإيقاف الأونلاين مؤقتاً.'
+          '📡 لا يوجد اتصال بالإنترنت: تم قفل عناصر الشبكة وتفعيل وضع الأوفلاين فقط (الفردي والمحلي).'
         );
       }
     };
@@ -564,28 +566,53 @@ function AppContent() {
       const wasOnline = isOnlineRef.current;
       isOnlineRef.current = true;
       setIsOnline(true);
-      setSelectedMode('online');
+      setSelectedMode(prev => (prev === 'solo' && !wasOnline ? 'online' : prev));
       if (!wasOnline && !showSplashRef.current) {
         showToast(
-          '🌐 عاد الاتصال بالإنترنت! تم فتح جميع أطوار الأونلاين والأصدقاء والبطولة السحابية.'
+          '🌐 عاد الاتصال بالإنترنت وقاعدة بيانات Firebase! تم فتح جميع أطوار الأونلاين والغرف والمتجر والمتصدرين.'
         );
       }
     };
 
-    window.addEventListener('online', applyOnlineRecovery);
-    window.addEventListener('offline', applyOfflineLockdown);
+    const runConnectivityHeartbeat = async () => {
+      if (isChecking) return;
+      isChecking = true;
+      try {
+        if (typeof navigator !== 'undefined' && !navigator.onLine) {
+          applyOfflineLockdown();
+          return;
+        }
+        const realConnected = await checkRealInternetAndFirebaseConnection(2500);
+        if (!realConnected) {
+          applyOfflineLockdown();
+        } else if (!isOnlineRef.current) {
+          applyOnlineRecovery();
+        }
+      } finally {
+        isChecking = false;
+      }
+    };
 
-    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    const handleWindowOnline = () => {
+      runConnectivityHeartbeat();
+    };
+    const handleWindowOffline = () => {
       applyOfflineLockdown();
-    } else {
-      setFirestoreOnlineMode(true);
-      isOnlineRef.current = true;
-      setIsOnline(true);
-    }
+    };
+
+    window.addEventListener('online', handleWindowOnline);
+    window.addEventListener('offline', handleWindowOffline);
+
+    runConnectivityHeartbeat();
+    const heartbeatInterval = window.setInterval(
+      runConnectivityHeartbeat,
+      3000
+    );
 
     return () => {
-      window.removeEventListener('online', applyOnlineRecovery);
-      window.removeEventListener('offline', applyOfflineLockdown);
+      window.removeEventListener('online', handleWindowOnline);
+      window.removeEventListener('offline', handleWindowOffline);
+      window.clearInterval(heartbeatInterval);
     };
   }, []);
 
@@ -1208,7 +1235,7 @@ function AppContent() {
                 { id: 'store', label: t.store, onlineOnly: true },
                 { id: 'leaderboard', label: t.leaderboard, onlineOnly: true },
                 { id: 'friends', label: t.friends, onlineOnly: true },
-                { id: 'achievements', label: t.achievements, onlineOnly: false },
+                { id: 'achievements', label: t.achievements, onlineOnly: true },
               ] as Array<{ id: ActiveTab; label: string; onlineOnly: boolean }>
             ).map(item => {
               const locked = item.onlineOnly && !isOnline;
@@ -1225,13 +1252,13 @@ function AppContent() {
                   }}
                   className={`transition-colors whitespace-nowrap shrink-0 flex items-center gap-1 ${
                     locked
-                      ? 'opacity-40 cursor-not-allowed text-slate-500'
+                      ? 'opacity-40 cursor-not-allowed text-slate-500 pointer-events-none'
                       : activeTab === item.id && !activeMatch
                       ? 'text-[#4FF5D2] underline underline-offset-8'
                       : 'hover:text-[#4FF5D2]'
                   }`}
                 >
-                  {locked && <Lock className="w-3 h-3" />}
+                  {locked && <Lock className="w-3 h-3 text-[#FF6B81]" />}
                   <span>{item.label}</span>
                 </button>
               );
@@ -1260,10 +1287,12 @@ function AppContent() {
               )}
             </span>
 
-            {/* Local Challenge Notifications Bell Button */}
+            {/* Local Challenge Notifications Bell Button (Locked when offline) */}
             <button
               type="button"
+              disabled={!isOnline}
               onClick={() => {
+                if (!isOnline) return;
                 soundFX.playClick();
                 setNotifDrawerOpen(prev => !prev);
                 setNotifications(prev => {
@@ -1272,24 +1301,27 @@ function AppContent() {
                   return next;
                 });
               }}
-              className="relative min-h-[38px] min-w-[38px] px-2.5 rounded-xl bg-[#111827] hover:bg-[#1B253B] border border-[#4FF5D2]/50 text-[#4FF5D2] flex items-center justify-center transition-colors"
+              className="relative min-h-[38px] min-w-[38px] px-2.5 rounded-xl bg-[#111827] hover:bg-[#1B253B] disabled:opacity-40 disabled:cursor-not-allowed disabled:pointer-events-none border border-[#4FF5D2]/50 text-[#4FF5D2] flex items-center justify-center transition-colors"
               title={t.notifCenterTitle}
               aria-label={t.notifCenterTitle}
             >
-              {notifications.some(n => !n.read) ||
-              incomingFriendRequests.length > 0 ? (
+              {!isOnline ? (
+                <Lock className="w-3.5 h-3.5 text-[#FF6B81]" />
+              ) : notifications.some(n => !n.read) ||
+                incomingFriendRequests.length > 0 ? (
                 <BellRing className="w-4 h-4 animate-bounce text-[#FFD166]" />
               ) : (
                 <Bell className="w-4 h-4" />
               )}
-              {notifications.filter(n => !n.read).length +
-                incomingFriendRequests.length >
-                0 && (
-                <span className="absolute -top-1.5 -right-1.5 min-w-[18px] h-[18px] px-1 rounded-full bg-[#FF6B81] text-[#070A12] text-[10px] font-mono-num font-extrabold flex items-center justify-center">
-                  {notifications.filter(n => !n.read).length +
-                    incomingFriendRequests.length}
-                </span>
-              )}
+              {isOnline &&
+                notifications.filter(n => !n.read).length +
+                  incomingFriendRequests.length >
+                  0 && (
+                  <span className="absolute -top-1.5 -right-1.5 min-w-[18px] h-[18px] px-1 rounded-full bg-[#FF6B81] text-[#070A12] text-[10px] font-mono-num font-extrabold flex items-center justify-center">
+                    {notifications.filter(n => !n.read).length +
+                      incomingFriendRequests.length}
+                  </span>
+                )}
             </button>
 
             <button
@@ -1301,8 +1333,9 @@ function AppContent() {
                 setActiveMatch(null);
                 setActiveTab('store');
               }}
-              className="px-3 sm:px-4 py-2 rounded-xl bg-[#111827] hover:bg-[#1B253B] disabled:opacity-45 border border-[#FFD166]/50 text-xs font-extrabold text-[#FFD166] whitespace-nowrap shrink-0 flex items-center gap-1.5"
+              className="px-3 sm:px-4 py-2 rounded-xl bg-[#111827] hover:bg-[#1B253B] disabled:opacity-40 disabled:cursor-not-allowed disabled:pointer-events-none border border-[#FFD166]/50 text-xs font-extrabold text-[#FFD166] whitespace-nowrap shrink-0 flex items-center gap-1.5"
             >
+              {!isOnline && <Lock className="w-3 h-3 text-[#FF6B81]" />}
               <span>🪙</span>
               <span dir="ltr" className="font-mono-num text-xs sm:text-sm font-extrabold">
                 {account.coins}
@@ -1654,20 +1687,30 @@ function AppContent() {
                   </div>
                 </div>
 
-                {/* Edit Profile, Copy Player ID & Settings Buttons */}
+                {/* Edit Profile, Copy Player ID & Settings Buttons (Locked when offline) */}
                 <div className="flex flex-wrap items-center gap-2">
                   <button
                     type="button"
+                    disabled={!isOnline}
                     onClick={() => {
+                      if (!isOnline) return;
                       soundFX.playClick();
                       setHomeEditUsername(account.username);
                       setHomeEditCountryCode(account.countryCode || 'SA');
                       setHomeEditError(null);
                       setIsEditingHomeProfile(prev => !prev);
                     }}
-                    className="min-h-[42px] px-3.5 rounded-xl bg-[#4FF5D2]/15 hover:bg-[#4FF5D2]/25 border border-[#4FF5D2]/60 text-xs font-extrabold text-[#4FF5D2] flex items-center gap-1.5 whitespace-nowrap transition-colors"
+                    className={`min-h-[42px] px-3.5 rounded-xl border text-xs font-extrabold flex items-center gap-1.5 whitespace-nowrap transition-colors ${
+                      !isOnline
+                        ? 'bg-[#070A12] border-[#28354E] text-slate-500 opacity-45 cursor-not-allowed pointer-events-none'
+                        : 'bg-[#4FF5D2]/15 hover:bg-[#4FF5D2]/25 border-[#4FF5D2]/60 text-[#4FF5D2]'
+                    }`}
                   >
-                    <span>✏️</span>
+                    {!isOnline ? (
+                      <Lock className="w-3.5 h-3.5 text-[#FF6B81]" />
+                    ) : (
+                      <span>✏️</span>
+                    )}
                     <span>
                       {account.language === 'ar'
                         ? 'تعديل الاسم والدولة'
@@ -1677,10 +1720,22 @@ function AppContent() {
 
                   <button
                     type="button"
-                    onClick={handleCopyId}
-                    className="min-h-[42px] px-3.5 rounded-xl bg-[#1B253B] hover:bg-[#28354E] border border-[#28354E] text-xs font-bold text-[#4FF5D2] flex items-center gap-1.5 whitespace-nowrap"
+                    disabled={!isOnline}
+                    onClick={() => {
+                      if (!isOnline) return;
+                      handleCopyId();
+                    }}
+                    className={`min-h-[42px] px-3.5 rounded-xl border text-xs font-bold flex items-center gap-1.5 whitespace-nowrap ${
+                      !isOnline
+                        ? 'bg-[#070A12] border-[#28354E] text-slate-500 opacity-45 cursor-not-allowed pointer-events-none'
+                        : 'bg-[#1B253B] hover:bg-[#28354E] border-[#28354E] text-[#4FF5D2]'
+                    }`}
                   >
-                    <Copy className="w-3.5 h-3.5" />
+                    {!isOnline ? (
+                      <Lock className="w-3.5 h-3.5 text-[#FF6B81]" />
+                    ) : (
+                      <Copy className="w-3.5 h-3.5" />
+                    )}
                     <span>
                       {copiedId ? t.copied : `${t.copyId} ${account.playerId}`}
                     </span>
@@ -1688,14 +1743,24 @@ function AppContent() {
 
                   <button
                     type="button"
+                    disabled={!isOnline}
                     onClick={() => {
+                      if (!isOnline) return;
                       soundFX.playClick();
                       setActiveTab('settings');
                     }}
-                    className="min-h-[42px] min-w-[42px] rounded-xl bg-[#1B253B] hover:bg-[#28354E] border border-[#28354E] flex items-center justify-center text-slate-300 hover:text-white"
+                    className={`min-h-[42px] min-w-[42px] rounded-xl border flex items-center justify-center ${
+                      !isOnline
+                        ? 'bg-[#070A12] border-[#28354E] text-slate-500 opacity-45 cursor-not-allowed pointer-events-none'
+                        : 'bg-[#1B253B] hover:bg-[#28354E] border-[#28354E] text-slate-300 hover:text-white'
+                    }`}
                     aria-label={t.settings}
                   >
-                    <Settings className="w-4 h-4" />
+                    {!isOnline ? (
+                      <Lock className="w-4 h-4 text-[#FF6B81]" />
+                    ) : (
+                      <Settings className="w-4 h-4" />
+                    )}
                   </button>
                 </div>
               </div>
@@ -1868,21 +1933,24 @@ function AppContent() {
                     soundFX.playClick();
                     setSelectedMode('online');
                   }}
-                  className={`p-4 rounded-2xl border text-start transition-all ${
+                  className={`relative overflow-hidden p-4 rounded-2xl border text-start transition-all ${
                     !isOnline
-                      ? 'bg-[#070A12] border-[#28354E] opacity-45 cursor-not-allowed'
+                      ? 'bg-[#070A12] border-[#28354E] opacity-50 cursor-not-allowed pointer-events-none'
                       : selectedMode === 'online'
                       ? 'bg-[#1B253B] border-[#4FF5D2] shadow-[0_0_20px_rgba(79,245,210,0.15)]'
                       : 'bg-[#111827] border-[#28354E] hover:bg-[#1B253B]/50'
                   }`}
                 >
+                  {!isOnline && (
+                    <div className="absolute inset-0 z-10 bg-[#070A12]/80 backdrop-blur-[2px] flex flex-col items-center justify-center gap-1 text-center p-2">
+                      <Lock className="w-5 h-5 text-[#FF6B81]" />
+                      <span className="text-[11px] font-extrabold text-[#FF6B81]">
+                        🔒 مقفل (يتطلب اتصالاً بالإنترنت)
+                      </span>
+                    </div>
+                  )}
                   <div className="flex items-center justify-between mb-1">
                     <span className="text-2xl">🌍</span>
-                    {!isOnline && (
-                      <span className="text-[10px] font-bold text-[#FF6B81] flex items-center gap-1">
-                        <Lock className="w-3 h-3" /> {t.requiresInternet}
-                      </span>
-                    )}
                   </div>
                   <div className="text-xs font-extrabold text-white mb-0.5">
                     {t.onlineMode}
@@ -1958,19 +2026,22 @@ function AppContent() {
                     setJoinRoomInput('');
                     setRoomModalOpen(true);
                   }}
-                  className={`p-4 rounded-2xl border text-start transition-all ${
+                  className={`relative overflow-hidden p-4 rounded-2xl border text-start transition-all ${
                     !isOnline
-                      ? 'bg-[#070A12] border-[#28354E] opacity-45 cursor-not-allowed'
+                      ? 'bg-[#070A12] border-[#28354E] opacity-50 cursor-not-allowed pointer-events-none'
                       : 'bg-[#111827] hover:bg-[#1B253B] border-[#FFD166]/60'
                   }`}
                 >
+                  {!isOnline && (
+                    <div className="absolute inset-0 z-10 bg-[#070A12]/80 backdrop-blur-[2px] flex flex-col items-center justify-center gap-1 text-center p-2">
+                      <Lock className="w-5 h-5 text-[#FF6B81]" />
+                      <span className="text-[11px] font-extrabold text-[#FF6B81]">
+                        🔒 مقفل (يتطلب اتصالاً بالإنترنت)
+                      </span>
+                    </div>
+                  )}
                   <div className="flex items-center justify-between mb-1">
                     <span className="text-2xl">🏠</span>
-                    {!isOnline && (
-                      <span className="text-[10px] font-bold text-[#FF6B81] flex items-center gap-1">
-                        <Lock className="w-3 h-3" /> {t.requiresInternet}
-                      </span>
-                    )}
                   </div>
                   <div className="text-xs font-extrabold text-[#FFD166] mb-0.5">
                     {t.privateRoom}
@@ -2249,13 +2320,13 @@ function AppContent() {
                 id: 'achievements',
                 icon: Award,
                 label: t.achievements,
-                onlineOnly: false,
+                onlineOnly: true,
               },
               {
                 id: 'settings',
                 icon: Settings,
                 label: t.settings,
-                onlineOnly: false,
+                onlineOnly: true,
               },
             ] as Array<{
               id: ActiveTab;
@@ -2277,15 +2348,20 @@ function AppContent() {
                   soundFX.playClick();
                   setActiveTab(tab.id);
                 }}
-                className={`min-h-[44px] flex flex-col items-center justify-center ${
+                className={`relative min-h-[44px] flex flex-col items-center justify-center ${
                   locked
-                    ? 'text-slate-600 opacity-45 cursor-not-allowed'
+                    ? 'text-slate-600 opacity-40 cursor-not-allowed pointer-events-none'
                     : active
                     ? 'text-[#4FF5D2]'
                     : 'text-slate-400'
                 }`}
               >
-                <IconComp className="w-5 h-5" />
+                <div className="relative flex items-center justify-center">
+                  <IconComp className="w-5 h-5" />
+                  {locked && (
+                    <Lock className="w-3 h-3 text-[#FF6B81] absolute -top-1 -right-2" />
+                  )}
+                </div>
                 <span className="text-[10px] font-bold mt-1 whitespace-nowrap truncate max-w-full px-0.5">
                   {tab.label}
                 </span>

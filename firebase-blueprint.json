@@ -183,6 +183,10 @@
         "currentRound": {
           "type": "number"
         },
+        "activeTurnUid": {
+          "type": "string",
+          "maxLength": 128
+        },
         "status": {
           "type": "string",
           "enum": ["waiting", "active", "finished", "completed"]
@@ -402,6 +406,12 @@
         "$ref": "#/entities/PrivateRoom"
       },
       "description": "4-digit private challenge rooms and live match state"
+    },
+    "/global_matchmaking/{roomId}": {
+      "schema": {
+        "$ref": "#/entities/PrivateRoom"
+      },
+      "description": "Real-time global online matchmaking rooms (100% human vs human, no bots)"
     },
     "/friend_requests/{requestId}": {
       "schema": {

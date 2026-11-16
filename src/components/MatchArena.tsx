@@ -10,7 +10,7 @@ import {
   SportsmanshipBadgeId,
   SportsmanshipReview,
 } from '../types';
-import { BOT_OPPONENTS_POOL, QUIZ_CATEGORIES } from '../data/constants';
+import { QUIZ_CATEGORIES } from '../data/constants';
 import {
   getMatchQuestions,
   getMatchQuestionsByIds,
@@ -18,10 +18,11 @@ import {
 import { soundFX } from '../utils/sound';
 import { getLocalizedCategory, getViewTranslations } from '../utils/i18n';
 import confetti from 'canvas-confetti';
-import { Flag, Volume2, VolumeX, Star } from 'lucide-react';
+import { Flag, Lock, Volume2, VolumeX, Star } from 'lucide-react';
 import {
   createCloudPrivateRoom,
   findOrCreateOnlineMatchmakingRoom,
+  getSafeDocUid,
   joinCloudPrivateRoom,
   subscribeToCloudRoom,
   updateCloudRoomState,
@@ -76,7 +77,9 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
   const vt = getViewTranslations(account.language);
   const baseAccountAtStartRef = useRef<PlayerAccount>(account);
   const matchIdRef = useRef<string>(`mtc_${Date.now()}`);
-  // Determine if opponent is human or Smart Bot (NEVER a bot in mode === 'room' or local mode)
+  const mySafeUid = getSafeDocUid(account);
+
+  // Bots are ONLY permitted in offline `mode === 'solo'`. NEVER in `mode === 'online'`, `'room'`, or `'local'`.
   const [opponentName, setOpponentName] = useState<string>(
     customOpponentName ||
       (mode === 'local'
@@ -85,24 +88,27 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         ? 'Solo 🎯'
         : mode === 'room'
         ? 'بانتظار دخول الصديق...'
-        : vt.searchingOpponentText)
+        : 'جاري البحث عن لاعب حقيقي...')
   );
   const [opponentFlag, setOpponentFlag] = useState<string>(
-    customOpponentFlag || (mode === 'local' ? '🎮' : mode === 'room' ? '⏳' : '🤖')
+    customOpponentFlag ||
+      (mode === 'local' ? '🎮' : mode === 'solo' ? '🤖' : '⏳')
   );
   const [opponentIsBot, setOpponentIsBot] = useState<boolean>(
-    mode === 'room' || mode === 'local'
-      ? false
-      : mode === 'solo' || !customOpponentName
+    mode === 'solo'
   );
   const [opponentPlayerId, setOpponentPlayerId] = useState<string | null>(
-    customOpponentPlayerId || (mode === 'room' ? 'غرفة تحدي سحابية' : customOpponentName ? '#7482910384' : null)
+    customOpponentPlayerId ||
+      (mode === 'room'
+        ? 'غرفة تحدي سحابية'
+        : mode === 'online'
+        ? 'بحث مباشر في السحابة'
+        : null)
   );
 
   const [phase, setPhase] = useState<MatchPhase>(
     mode === 'online' || mode === 'room' ? 'MATCHMAKING' : 'PLAYING_ROUND'
   );
-  const [matchmakingSec, setMatchmakingSec] = useState(4);
   const [activeRoomCode, setActiveRoomCode] = useState<string | undefined>(
     roomCode
   );
@@ -111,6 +117,11 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
   const [roomCloudStatus, setRoomCloudStatus] = useState<
     'waiting' | 'active' | 'finished'
   >('waiting');
+  const [activeTurnUid, setActiveTurnUid] = useState<string>(account.uid || mySafeUid);
+  const activeTurnUidRef = useRef<string>(account.uid || mySafeUid);
+  activeTurnUidRef.current = activeTurnUid;
+  const roomHostUidRef = useRef<string>(account.uid || mySafeUid);
+  const roomGuestUidRef = useRef<string>('');
   const [waitingOpponentStep, setWaitingOpponentStep] = useState<boolean>(false);
   const [opponentSelectedOption, setOpponentSelectedOption] =
     useState<number>(-1);
@@ -245,19 +256,29 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
   // Background 15-second Anti-Cheat monitor for Online mode
   const bgEnteredAtRef = useRef<number | null>(null);
 
-  const isLiveCloudMatch = Boolean(
-    activeRoomCode && (mode === 'room' || !opponentIsBot)
-  );
+  const isLiveCloudMatch = Boolean(mode === 'room' || mode === 'online');
   const isLiveCloudMatchRef = useRef<boolean>(isLiveCloudMatch);
   isLiveCloudMatchRef.current = isLiveCloudMatch;
 
-  // In live cloud match (room or matched online human), both players answer every question on their own device in real time
+  // Strict Turn-Based Locking (`activeTurnUid`):
+  // In `online` and `room` modes, ONLY the player whose UID matches `activeTurnUid` can answer!
+  // The other player's buttons are locked (`disabled={true}`) with a full waiting overlay until the turn switches in Firestore.
+  const isMyTurnInCloud =
+    activeTurnUid === account.uid ||
+    activeTurnUid === mySafeUid ||
+    (isRoomHostRef.current &&
+      roomHostUidRef.current.length > 0 &&
+      activeTurnUid === roomHostUidRef.current) ||
+    (!isRoomHostRef.current &&
+      roomGuestUidRef.current.length > 0 &&
+      activeTurnUid === roomGuestUidRef.current);
+
   const isPlayerTurn =
-    phase === 'SUDDEN_DEATH'
+    isLiveCloudMatch
+      ? isMyTurnInCloud
+      : phase === 'SUDDEN_DEATH' || mode === 'solo'
       ? true
-      : mode === 'solo' || mode === 'room' || isLiveCloudMatch
-      ? true
-      : questionInRound % 2 === 1; // Q1, Q3, Q5, Q7 are Player 1; Q2, Q4, Q6, Q8 are Opponent/Player 2
+      : questionInRound % 2 === 1; // Local 2-player mode alternates Q1/Q3/Q5/Q7 vs Q2/Q4/Q6/Q8
 
   const isGoldenQuestion =
     phase === 'PLAYING_ROUND' && (questionInRound === 7 || questionInRound === 8);
@@ -283,33 +304,42 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
     }
   }, [roomCode]);
 
-  // Real online matchmaking in Firestore for `mode === 'online'` (matches two real players into a shared cloud room if both are searching)
+  // Real online matchmaking in Firestore `global_matchmaking` for `mode === 'online'` (100% Real Players, Zero Bots)
   useEffect(() => {
     if (mode !== 'online' || roomCode || phase !== 'MATCHMAKING') return;
     let cancelled = false;
-    findOrCreateOnlineMatchmakingRoom(account, category)
-      .then(res => {
-        if (cancelled || !res || !res.roomCode) return;
-        if (phaseRef.current !== 'MATCHMAKING') return;
-        isRoomHostRef.current = res.role === 'host';
-        activeRoomCodeRef.current = res.roomCode;
-        setActiveRoomCode(res.roomCode);
-        if (res.role === 'guest' && res.hostName) {
-          setOpponentName(res.hostName);
-          setOpponentFlag(res.hostFlag || '🇸🇦');
-          setOpponentIsBot(false);
-          if (res.hostPlayerId) {
-            setOpponentPlayerId(res.hostPlayerId);
-          }
+
+    const searchOrCreateQueueRoom = async () => {
+      const res = await findOrCreateOnlineMatchmakingRoom(account, 'cocktail');
+      if (cancelled || !res || !res.roomCode) return;
+      if (phaseRef.current !== 'MATCHMAKING') return;
+      isRoomHostRef.current = res.role === 'host';
+      if (res.hostUid) roomHostUidRef.current = res.hostUid;
+      if (res.guestUid) roomGuestUidRef.current = res.guestUid;
+      if (res.activeTurnUid) {
+        activeTurnUidRef.current = res.activeTurnUid;
+        setActiveTurnUid(res.activeTurnUid);
+      }
+      activeRoomCodeRef.current = res.roomCode;
+      setActiveRoomCode(res.roomCode);
+      if (res.role === 'guest' && res.hostName) {
+        setOpponentName(res.hostName);
+        setOpponentFlag(res.hostFlag || '🇸🇦');
+        setOpponentIsBot(false);
+        if (res.hostPlayerId) {
+          setOpponentPlayerId(res.hostPlayerId);
         }
-      })
-      .catch(() => {});
+      }
+    };
+
+    searchOrCreateQueueRoom().catch(() => {});
+
     return () => {
       cancelled = true;
     };
   }, [mode, roomCode, category]);
 
-  // 1. Real Cloud Room Subscription (`onSnapshot` on `rooms/{activeRoomCode}`)
+  // 1. Real Cloud Room Subscription (`onSnapshot` on `rooms/{activeRoomCode}` or `global_matchmaking/{activeRoomCode}`)
   useEffect(() => {
     if (!activeRoomCode) return;
     if (mode !== 'room' && mode !== 'online') return;
@@ -340,18 +370,29 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         const guestName = String(data.guestName || '');
         const guestFlag = String(data.guestFlag || '🇸🇦');
         const guestPlayerId = String(data.guestPlayerId || '');
+        const cloudActiveTurnUid = String(
+          data.activeTurnUid || hostUid || account.uid || mySafeUid
+        );
         const status = String(data.status || 'waiting') as
           | 'waiting'
           | 'active'
           | 'finished'
           | 'completed';
 
+        if (hostUid) roomHostUidRef.current = hostUid;
+        if (guestUid) roomGuestUidRef.current = guestUid;
+        activeTurnUidRef.current = cloudActiveTurnUid;
+        setActiveTurnUid(cloudActiveTurnUid);
+
         setRoomCloudStatus(status === 'completed' ? 'finished' : status);
 
         // Determine whether this device is the Host or the Guest
         const isHost =
           (hostPlayerId && hostPlayerId === account.playerId) ||
-          (hostUid && hostUid === account.uid && guestUid !== account.uid) ||
+          (hostUid &&
+            (hostUid === account.uid || hostUid === mySafeUid) &&
+            guestUid !== account.uid &&
+            guestUid !== mySafeUid) ||
           (!guestPlayerId && hostName === account.username) ||
           (hostName === account.username && guestName !== account.username);
         isRoomHostRef.current = isHost;
@@ -385,18 +426,21 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         }
 
         // Synchronize unified questionIds & questionSeeds from Firestore so both phones get the exact same 25 questions
+        const cloudCat = (String(data.category || category) || 'cocktail') as CategoryId;
         const qSeed = Number(data.questionSeed || numericSeed || 7);
         const seedsArr = Array.isArray(data.questionSeeds)
           ? data.questionSeeds.map((n: unknown) => Number(n) || 0)
           : undefined;
 
         if (Array.isArray(data.questionIds) && data.questionIds.length > 0) {
-          const qIds = data.questionIds.map((id: unknown) => String(id || '')).filter(Boolean);
+          const qIds = data.questionIds
+            .map((id: unknown) => String(id || ''))
+            .filter(Boolean);
           const idsKey = `${qIds.join(',')}|${seedsArr ? seedsArr.join(',') : ''}`;
           if (qIds.length > 0 && appliedQuestionIdsKeyRef.current !== idsKey) {
             appliedQuestionIdsKeyRef.current = idsKey;
             setQuestions(
-              getMatchQuestionsByIds(category, qIds, qSeed, seedsArr)
+              getMatchQuestionsByIds(cloudCat, qIds, qSeed, seedsArr)
             );
           }
         } else if (seedsArr && seedsArr.length > 0) {
@@ -405,7 +449,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
             appliedSeedsKeyRef.current = key;
             setQuestions(
               getMatchQuestions(
-                category,
+                cloudCat,
                 25,
                 account.seenQuestionIds || [],
                 qSeed,
@@ -426,11 +470,6 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           isHost
             ? data.guestSelectedOption ?? -1
             : data.hostSelectedOption ?? -1
-        );
-        const mySelectedOptInCloud = Number(
-          isHost
-            ? data.hostSelectedOption ?? -1
-            : data.guestSelectedOption ?? -1
         );
         const remoteReadyBreak = Boolean(
           isHost ? data.guestReadyNextRound : data.hostReadyNextRound
@@ -457,7 +496,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           setOpponentReadyBreak(true);
         }
 
-        // Transition from MATCHMAKING ('waiting') -> PLAYING_ROUND ONLY when Guest actually joins and status === 'active'
+        // Transition from MATCHMAKING ('waiting') -> PLAYING_ROUND ONLY when a second real human player joins and status === 'active'
         if (
           phaseRef.current === 'MATCHMAKING' &&
           status === 'active' &&
@@ -478,8 +517,9 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
             ? 25
             : (currentRoundRef.current - 1) * 8 + questionInRoundRef.current;
 
-        // 1) If Firestore `currentRound` (0-indexed question index) has advanced to `activeStep` (i.e. currentQuestionIndex + 1),
-        // advance both phones simultaneously to the exact same question!
+        // Strict Turn-Based Progression:
+        // Whenever the active player finishes their turn, they update `currentRound: activeStep` and `activeTurnUid: nextPlayerUid` in Firestore.
+        // Both devices immediately advance to the next question and hand over the turn!
         if (
           (phaseRef.current === 'PLAYING_ROUND' ||
             phaseRef.current === 'SUDDEN_DEATH') &&
@@ -490,33 +530,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           setWaitingOpponentStep(false);
           window.setTimeout(() => {
             proceedToNextRoomStep(activeStep);
-          }, 350);
-        }
-
-        // 2) Or if both players have now answered the current question (`myAnsweredStep >= activeStep && remoteAnswered >= activeStep`
-        // or both selected options are !== -1), update `currentRound: activeStep` in Firestore and advance both phones together!
-        const bothSelectedInCloud =
-          mySelectedOptInCloud !== -1 && remoteSelectedOpt !== -1;
-        if (
-          (phaseRef.current === 'PLAYING_ROUND' ||
-            phaseRef.current === 'SUDDEN_DEATH') &&
-          ((myAnsweredStepRef.current >= activeStep &&
-            remoteAnswered >= activeStep) ||
-            bothSelectedInCloud) &&
-          stepAdvancedRef.current < activeStep
-        ) {
-          stepAdvancedRef.current = activeStep;
-          setWaitingOpponentStep(false);
-          if (isHost && cloudQuestionIdx < activeStep) {
-            updateCloudRoomState(activeRoomCode, {
-              currentRound: activeStep,
-              hostSelectedOption: -1,
-              guestSelectedOption: -1,
-            }).catch(() => {});
-          }
-          window.setTimeout(() => {
-            proceedToNextRoomStep(activeStep);
-          }, 650);
+          }, 450);
         }
 
         // If opponent finished/forfeited early while we are still in an earlier round
@@ -524,8 +538,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           (status === 'finished' || status === 'completed') &&
           phaseRef.current !== 'MATCH_OVER' &&
           phaseRef.current !== 'MATCHMAKING' &&
-          remoteAnswered < 24 &&
-          myAnsweredStepRef.current > remoteAnswered + 1
+          cloudQuestionIdx < 24
         ) {
           triggerMatchEnd(
             'forfeit_win',
@@ -559,53 +572,10 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
     account.playerId,
     account.uid,
     account.username,
+    mySafeUid,
     category,
     customOpponentPlayerId,
   ]);
-
-  // 1B. Matchmaking countdown ONLY for `mode === 'online'` (NEVER for `mode === 'room'`)
-  useEffect(() => {
-    if (phase !== 'MATCHMAKING') return;
-    // CRITICAL: In `mode === 'room'`, never run a local timer or spawn a bot!
-    // Wait strictly for Firestore `onSnapshot` to report `status === 'active'`.
-    if (mode === 'room') return;
-
-    const timer = setInterval(() => {
-      setMatchmakingSec(prev => {
-        if (prev <= 1) {
-          clearInterval(timer);
-          // If a real human player already joined the online matchmaking room, `phase` is already 'PLAYING_ROUND'
-          if (phaseRef.current !== 'MATCHMAKING') return 0;
-          if (!customOpponentName && opponentIsBot) {
-            // Close the unclaimed waiting room in Firestore and fall back to bot in solo/online queue
-            if (activeRoomCodeRef.current) {
-              const unclaimedCode = activeRoomCodeRef.current;
-              activeRoomCodeRef.current = undefined;
-              setActiveRoomCode(undefined);
-              updateCloudRoomState(unclaimedCode, { status: 'finished' }).catch(
-                () => {}
-              );
-            }
-            const bot =
-              BOT_OPPONENTS_POOL[
-                Math.floor(Math.random() * BOT_OPPONENTS_POOL.length)
-              ];
-            setOpponentName(bot.name);
-            setOpponentFlag(bot.flag);
-            setOpponentIsBot(true);
-            setOpponentPlayerId(null); // Bots never have an ID
-          }
-          soundFX.playCorrect();
-          answerLockRef.current = false;
-          questionStartMsRef.current = Date.now();
-          setPhase('PLAYING_ROUND');
-          return 0;
-        }
-        return prev - 1;
-      });
-    }, 950);
-    return () => clearInterval(timer);
-  }, [phase, mode, customOpponentName, opponentIsBot]);
 
   // 2. Background Visibility Monitor (15s rule in Online mode)
   useEffect(() => {
@@ -642,6 +612,8 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
   }, [mode, phase]);
 
   // 3. Question 6-second countdown timer
+  // In live cloud matches (`online` / `room`), only the active turn player (`isPlayerTurn`) triggers timeout submission;
+  // the waiting player displays the countdown visually while waiting for Firestore `onSnapshot` turn handover.
   useEffect(() => {
     if (phase !== 'PLAYING_ROUND' && phase !== 'SUDDEN_DEATH') return;
     if (isAnswerLocked) return;
@@ -650,26 +622,30 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
       setTimeLeft(prev => {
         if (prev <= 1) {
           clearInterval(timer);
-          handleTimeoutAnswer();
+          if (!isLiveCloudMatchRef.current || isPlayerTurn) {
+            handleTimeoutAnswer();
+          }
           return 0;
         }
         const nextVal = prev - 1;
-        if (nextVal <= 2) {
-          soundFX.playTick(true);
-        } else {
-          soundFX.playTick(false);
+        if (isPlayerTurn || !isLiveCloudMatchRef.current) {
+          if (nextVal <= 2) {
+            soundFX.playTick(true);
+          } else {
+            soundFX.playTick(false);
+          }
         }
         return nextVal;
       });
     }, 1000);
 
     return () => clearInterval(timer);
-  }, [phase, currentRound, questionInRound, isAnswerLocked]);
+  }, [phase, currentRound, questionInRound, isAnswerLocked, isPlayerTurn]);
 
-  // 4. Smart Bot AI automatic turn execution (STRICTLY DISABLED IN `mode === 'room'` AND `mode === 'local'`)
+  // 4. Smart Bot AI automatic turn execution (STRICTLY RESTRICTED TO OFFLINE `mode === 'solo'` ONLY — NEVER IN ONLINE OR ROOM)
   useEffect(() => {
     if (phase !== 'PLAYING_ROUND') return;
-    if (mode === 'room' || mode === 'local' || !opponentIsBot) return;
+    if (mode !== 'solo' || !opponentIsBot) return;
     if (isPlayerTurn || isAnswerLocked) return;
 
     // Bot calculates accuracy and delay from difficulty & persona
@@ -818,9 +794,11 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
   ]);
 
   /**
-   * Synchronizes the player's score, selected option, roundWinnerUid, and answered step to Firestore
-   * in `isLiveCloudMatch` (room mode or online mode with a real human opponent),
-   * and advances both phones together to `currentRound + 1` as soon as both players answer or the timer expires.
+   * Strict Turn-Based Cloud Synchronization (`activeTurnUid`):
+   * As soon as the active player answers (or their 6-second timer expires), updates their score,
+   * switches `activeTurnUid` to the other player (`hostUid` <-> `guestUid`), and advances `currentRound`
+   * to `stepNum` in Firestore so `onSnapshot` immediately unlocks Player 2's screen with the next question
+   * and locks Player 1's screen!
    */
   const syncAndCoordinateRoomStep = (
     newTotalPlayerScore: number,
@@ -830,55 +808,36 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
   ) => {
     myAnsweredStepRef.current = stepNum;
     const roomIdToUpdate = activeRoomCodeRef.current;
-    const opponentAlreadyAnsweredThisStep =
-      remoteAnsweredStepRef.current >= stepNum ||
-      opponentSelectedOptionRef.current !== -1;
+    const nextTurnUid = isRoomHostRef.current
+      ? roomGuestUidRef.current || 'plr_guest'
+      : roomHostUidRef.current || 'plr_host';
 
     if (roomIdToUpdate) {
       const winnerPatch =
         wasCorrect && !cloudRoundWinnerUidRef.current
-          ? { roundWinnerUid: account.uid || account.playerId }
+          ? { roundWinnerUid: account.uid || mySafeUid }
           : {};
-      const nextRoundPatch = opponentAlreadyAnsweredThisStep
-        ? {
-            currentRound: stepNum,
-            hostSelectedOption: -1,
-            guestSelectedOption: -1,
-          }
-        : {};
       const payload = isRoomHostRef.current
         ? {
             hostScore: Math.min(500, newTotalPlayerScore),
             hostAnsweredRound: stepNum,
             hostSelectedOption: chosenOptionIdx,
+            activeTurnUid: nextTurnUid,
+            currentRound: stepNum,
             ...winnerPatch,
-            ...nextRoundPatch,
           }
         : {
             guestScore: Math.min(500, newTotalPlayerScore),
             guestAnsweredRound: stepNum,
             guestSelectedOption: chosenOptionIdx,
+            activeTurnUid: nextTurnUid,
+            currentRound: stepNum,
             ...winnerPatch,
-            ...nextRoundPatch,
           };
       updateCloudRoomState(roomIdToUpdate, payload).catch(() => {});
     }
 
-    // If opponent already answered this step in Firestore, advance both devices together after brief visual reveal
-    if (opponentAlreadyAnsweredThisStep) {
-      if (stepAdvancedRef.current < stepNum) {
-        stepAdvancedRef.current = stepNum;
-        setWaitingOpponentStep(false);
-        window.setTimeout(() => {
-          proceedToNextRoomStep(stepNum);
-        }, 700);
-      }
-      return;
-    }
-
-    // Otherwise, show live waiting indicator until opponent answers OR the question timer expires
-    setWaitingOpponentStep(true);
-    const maxWaitMs = Math.max(1400, timeLeft * 1000 + 1800);
+    // Advance after brief visual reveal of the chosen answer
     window.setTimeout(() => {
       if (
         stepAdvancedRef.current < stepNum &&
@@ -886,16 +845,11 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
       ) {
         stepAdvancedRef.current = stepNum;
         setWaitingOpponentStep(false);
-        if (roomIdToUpdate) {
-          updateCloudRoomState(roomIdToUpdate, {
-            currentRound: stepNum,
-            hostSelectedOption: -1,
-            guestSelectedOption: -1,
-          }).catch(() => {});
-        }
+        activeTurnUidRef.current = nextTurnUid;
+        setActiveTurnUid(nextTurnUid);
         proceedToNextRoomStep(stepNum);
       }
-    }, maxWaitMs);
+    }, 650);
   };
 
   const proceedToNextRoomStep = (completedStep: number) => {
@@ -1009,7 +963,8 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
 
   const submitTurnAnswer = (optionIdx: number, isBotAction: boolean = false) => {
     if (isAnswerLocked || answerLockRef.current) return;
-    if (isBotAction && (mode === 'room' || isLiveCloudMatchRef.current)) return; // Double guard: never accept bot actions in rooms or live human matches
+    if (isBotAction && (mode !== 'solo' || isLiveCloudMatchRef.current)) return; // Strict guard: never accept bot actions outside solo mode
+    if (isLiveCloudMatchRef.current && !isPlayerTurn) return; // Strict turn guard: cannot answer during opponent's turn
     answerLockRef.current = true;
 
     // Anti-Cheat check for human touches (< 120ms impossible reaction speed)
@@ -1528,7 +1483,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
 
   const locCategory = getLocalizedCategory(categoryMeta, account.language);
 
-  // RENDER 1: Matchmaking Lobby / Real Firestore Waiting Room (`status === 'waiting'`)
+  // RENDER 1: Matchmaking Lobby / Real Firestore Waiting Room (`status === 'waiting'`) — 100% Real Players Only
   if (phase === 'MATCHMAKING') {
     const isPrivateWaitingRoom = mode === 'room';
     return (
@@ -1536,22 +1491,28 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         <div className="w-full max-w-md rounded-3xl bg-[#111827] border border-[#28354E] p-8 shadow-2xl">
           <div className="text-4xl mb-3">{categoryMeta.icon}</div>
           <h2 className="text-xl font-extrabold text-white mb-1">
-            {roomCode ? `غرفة التحدي #${roomCode} · ${locCategory.name}` : locCategory.name}
+            {roomCode
+              ? `غرفة التحدي #${roomCode} · ${locCategory.name}`
+              : `الأونلاين المباشر · ${locCategory.name}`}
           </h2>
-          <p className="text-xs text-slate-300 mb-3">
+          <p className="text-xs text-[#4FF5D2] font-extrabold mb-3 animate-pulse">
             {isPrivateWaitingRoom
-              ? '⏳ شاشة انتظار حقيقية (متصلة بـ Cloud Firestore): لن يبدأ السؤال الأول إلا عند دخول اللاعب الثاني فعلياً للغرفة!'
-              : vt.searchingOpponentText}
+              ? '⏳ شاشة انتظار حقيقية (Cloud Firestore): لن يبدأ السؤال الأول إلا عند دخول اللاعب الثاني فعلياً للغرفة!'
+              : '🔍 جاري البحث عن لاعب حقيقي متصل الآن...'}
           </p>
 
-          {isPrivateWaitingRoom && roomCode && (
+          {activeRoomCode && (
             <div className="mb-4 px-4 py-2.5 rounded-2xl bg-[#070A12] border border-[#FFD166]/60 inline-flex items-center gap-2">
-              <span className="text-xs text-slate-400">كود الغرفة:</span>
-              <span className="text-lg font-mono-num font-extrabold text-[#FFD166] tracking-widest">
-                #{roomCode}
+              <span className="text-xs text-slate-400">
+                {isPrivateWaitingRoom ? 'كود الغرفة:' : 'غرفة المطابقة السحابية:'}
+              </span>
+              <span className="text-sm sm:text-base font-mono-num font-extrabold text-[#FFD166] tracking-wider">
+                #{activeRoomCode}
               </span>
               <span className="px-2 py-0.5 rounded-lg bg-[#4FF5D2]/15 text-[#4FF5D2] text-[10px] font-extrabold">
-                الحالة: {roomCloudStatus === 'waiting' ? 'بانتظار الخصم (waiting)' : 'نشطة (active)'}
+                {roomCloudStatus === 'waiting'
+                  ? 'بانتظار لاعب حقيقي (waiting)'
+                  : 'نشطة (active)'}
               </span>
             </div>
           )}
@@ -1576,19 +1537,26 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
                   ? customOpponentName
                     ? `بانتظار قبول ${customOpponentName}...`
                     : 'بانتظار انضمام اللاعب الثاني...'
-                  : `${vt.startingInSec} ${matchmakingSec}s`}
+                  : '🔍 جاري البحث عن لاعب حقيقي متصل الآن...'}
               </span>
-              <span className="text-[11px] text-[#4FF5D2] font-mono-num">
+              <span className="text-[11px] text-[#4FF5D2] font-mono-num mt-0.5">
                 {isPrivateWaitingRoom
                   ? customOpponentPlayerId || 'بدون بوت نهائياً (100% Real Player)'
-                  : 'Fair Play Arena'}
+                  : 'بدون بوت نهائياً · 100% لاعب حقيقي'}
               </span>
             </div>
           </div>
 
           <button
             type="button"
-            onClick={onCancelLobby}
+            onClick={() => {
+              if (activeRoomCodeRef.current) {
+                updateCloudRoomState(activeRoomCodeRef.current, {
+                  status: 'finished',
+                }).catch(() => {});
+              }
+              onCancelLobby();
+            }}
             className="w-full min-h-[44px] rounded-xl bg-[#1B253B] hover:bg-[#28354E] text-xs font-bold text-slate-300"
           >
             {vt.cancelSearchBtn}
@@ -2059,13 +2027,9 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         <div className="text-xs font-bold">
           {phase === 'SUDDEN_DEATH' ? (
             <span className="text-[#FFD166]">⚡ Sudden Death!</span>
-          ) : isLiveCloudMatch && waitingOpponentStep ? (
-            <span className="text-[#FFD166] animate-pulse">
-              ⏳ تم تسجيل إجابتك — بانتظار إجابة {opponentName} للانتقال معاً للسؤال التالي...
-            </span>
-          ) : isLiveCloudMatch && hasOpponentAnsweredCurrentStep && !isAnswerLocked ? (
-            <span className="text-[#38D9A9] animate-pulse">
-              ⚡ أجاب {opponentName} على هذا السؤال! أجب الآن قبل انتهاء المؤقت!
+          ) : isLiveCloudMatch && !isPlayerTurn ? (
+            <span className="text-[#FF6B81] animate-pulse">
+              🔒 دور خصمك الآن للإجابة... انتظر دورك!
             </span>
           ) : isPlayerTurn ? (
             <span className="text-[#4FF5D2]">{vt.yourTurnBanner}</span>
@@ -2097,62 +2061,78 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           {currentQuestion.questionAr}
         </h3>
 
-        {/* 4 Answer Options */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-          {currentQuestion.optionsAr.map((optText, idx) => {
-            const isHidden = hiddenOptions.includes(idx);
-            if (isHidden) {
-              return (
-                <div
-                  key={idx}
-                  className="min-h-[54px] rounded-2xl bg-[#070A12]/40 border border-[#28354E]/40 flex items-center justify-center text-xs text-slate-600"
-                >
-                  50:50
-                </div>
-              );
-            }
+        {/* 4 Answer Options with Strict Turn-Based Lock Overlay when activeTurnUid !== account.uid */}
+        <div className="relative">
+          {isLiveCloudMatch && !isPlayerTurn && (
+            <div className="absolute inset-0 z-20 rounded-2xl bg-[#070A12]/85 backdrop-blur-[3px] border-2 border-[#FF6B81]/70 flex flex-col items-center justify-center p-4 text-center shadow-2xl">
+              <div className="w-12 h-12 rounded-2xl bg-[#FF6B81]/20 border border-[#FF6B81] flex items-center justify-center text-[#FF6B81] mb-2 animate-pulse">
+                <Lock className="w-6 h-6" />
+              </div>
+              <p className="text-sm sm:text-base font-extrabold text-white">
+                🔒 دور خصمك الآن للإجابة... انتظر دورك!
+              </p>
+              <p className="text-[11px] font-bold text-[#4FF5D2] mt-1">
+                سيُفتح دورك وسؤالك التالي تلقائياً فور انتهاء {opponentName} من الإجابة
+              </p>
+            </div>
+          )}
 
-            let btnStyle =
-              'bg-[#1B253B] hover:bg-[#28354E] border-[#28354E] text-white';
-            if (isAnswerLocked) {
-              if (idx === currentQuestion.correctIndex) {
-                btnStyle =
-                  'bg-[#10B981]/25 border-[#38D9A9] text-[#38D9A9] shadow-[0_0_15px_rgba(16,185,129,0.3)]';
-              } else if (idx === selectedOption) {
-                btnStyle = 'bg-[#FF6B81]/25 border-[#FF6B81] text-[#FF6B81]';
-              } else {
-                btnStyle = 'bg-[#070A12]/50 border-[#28354E] text-slate-500';
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            {currentQuestion.optionsAr.map((optText, idx) => {
+              const isHidden = hiddenOptions.includes(idx);
+              if (isHidden) {
+                return (
+                  <div
+                    key={idx}
+                    className="min-h-[54px] rounded-2xl bg-[#070A12]/40 border border-[#28354E]/40 flex items-center justify-center text-xs text-slate-600"
+                  >
+                    50:50
+                  </div>
+                );
               }
-            }
 
-            const canPlayerClick =
-              !isAnswerLocked && (isPlayerTurn || mode === 'local');
-            const isOpponentPickedThis =
-              isLiveCloudMatch &&
-              isAnswerLocked &&
-              opponentSelectedOption >= 0 &&
-              opponentSelectedOption === idx;
+              let btnStyle =
+                'bg-[#1B253B] hover:bg-[#28354E] border-[#28354E] text-white';
+              if (isAnswerLocked) {
+                if (idx === currentQuestion.correctIndex) {
+                  btnStyle =
+                    'bg-[#10B981]/25 border-[#38D9A9] text-[#38D9A9] shadow-[0_0_15px_rgba(16,185,129,0.3)]';
+                } else if (idx === selectedOption) {
+                  btnStyle = 'bg-[#FF6B81]/25 border-[#FF6B81] text-[#FF6B81]';
+                } else {
+                  btnStyle = 'bg-[#070A12]/50 border-[#28354E] text-slate-500';
+                }
+              }
 
-            return (
-              <button
-                key={idx}
-                type="button"
-                disabled={!canPlayerClick}
-                onClick={() => submitTurnAnswer(idx, false)}
-                className={`min-h-[56px] px-4 py-3 rounded-2xl border font-bold text-sm text-start flex items-center justify-between gap-2 transition-all ${btnStyle}`}
-              >
-                <span className="leading-snug flex-1">{optText}</span>
-                {isOpponentPickedThis && (
-                  <span className="px-2 py-0.5 rounded-lg bg-[#A78BFA]/25 border border-[#A78BFA] text-[10px] font-extrabold text-[#A78BFA] shrink-0">
-                    {opponentFlag} اختيار الخصم
+              const canPlayerClick =
+                !isAnswerLocked && (isPlayerTurn || mode === 'local');
+              const isOpponentPickedThis =
+                isLiveCloudMatch &&
+                isAnswerLocked &&
+                opponentSelectedOption >= 0 &&
+                opponentSelectedOption === idx;
+
+              return (
+                <button
+                  key={idx}
+                  type="button"
+                  disabled={!canPlayerClick}
+                  onClick={() => submitTurnAnswer(idx, false)}
+                  className={`min-h-[56px] px-4 py-3 rounded-2xl border font-bold text-sm text-start flex items-center justify-between gap-2 transition-all disabled:cursor-not-allowed ${btnStyle}`}
+                >
+                  <span className="leading-snug flex-1">{optText}</span>
+                  {isOpponentPickedThis && (
+                    <span className="px-2 py-0.5 rounded-lg bg-[#A78BFA]/25 border border-[#A78BFA] text-[10px] font-extrabold text-[#A78BFA] shrink-0">
+                      {opponentFlag} اختيار الخصم
+                    </span>
+                  )}
+                  <span className="w-7 h-7 rounded-lg bg-[#070A12]/60 flex items-center justify-center text-xs font-mono-num shrink-0 mr-1">
+                    {idx + 1}
                   </span>
-                )}
-                <span className="w-7 h-7 rounded-lg bg-[#070A12]/60 flex items-center justify-center text-xs font-mono-num shrink-0 mr-1">
-                  {idx + 1}
-                </span>
-              </button>
-            );
-          })}
+                </button>
+              );
+            })}
+          </div>
         </div>
       </div>
 
