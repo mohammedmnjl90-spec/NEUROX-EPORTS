@@ -31,7 +31,7 @@ jobs:
       - name: Install dependencies and Capacitor
         run: |
           npm install --legacy-peer-deps
-          npm install --legacy-peer-deps @capacitor/core@7 @capacitor/cli@7 @capacitor/android@7 typescript@5
+          npm install --legacy-peer-deps @capacitor/core@7 @capacitor/cli@7 @capacitor/android@7 @capacitor/assets sharp typescript@5
 
       - name: Build web application
         run: npm run build -- --base=./
@@ -45,6 +45,32 @@ jobs:
         run: |
           rm -rf android
           npx cap add android
+
+      - name: Generate Android Launcher Icons from assets/icon.svg or assets/icon.png
+        run: |
+          node -e "
+            const fs = require('fs');
+            const sharp = require('sharp');
+            (async () => {
+              const src = fs.existsSync('assets/icon.png') ? 'assets/icon.png' : 'assets/icon.svg';
+              console.log('Generating 1024x1024 icon from:', src);
+              await sharp(src)
+                .resize(1024, 1024, { fit: 'contain', background: '#070A12' })
+                .png()
+                .toFile('assets/icon-only.png');
+              await sharp('assets/icon-only.png').toFile('assets/icon-foreground.png');
+              await sharp({
+                create: { width: 1024, height: 1024, channels: 4, background: '#070A12' }
+              }).png().toFile('assets/icon-background.png');
+              await sharp(src)
+                .resize(1024, 1024, { fit: 'contain', background: '#070A12' })
+                .extend({ top: 854, bottom: 854, left: 854, right: 854, background: '#070A12' })
+                .png()
+                .toFile('assets/splash.png');
+              await sharp('assets/splash.png').toFile('assets/splash-dark.png');
+            })();
+          "
+          npx @capacitor/assets generate --android --iconBackgroundColor '#070A12' --iconBackgroundColorDark '#070A12'
 
       - name: Sync Android
         run: npx cap sync android
