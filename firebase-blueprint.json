@@ -116,7 +116,7 @@
     },
     "PrivateRoom": {
       "title": "PrivateRoom",
-      "description": "4-digit private challenge room with deterministic question seed",
+      "description": "4-digit private challenge room and live online match state with synchronized round, options, and question IDs",
       "type": "object",
       "properties": {
         "roomCode": {
@@ -174,6 +174,15 @@
             "type": "number"
           }
         },
+        "questionIds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "currentRound": {
+          "type": "number"
+        },
         "status": {
           "type": "string",
           "enum": ["waiting", "active", "finished", "completed"]
@@ -183,6 +192,16 @@
         },
         "guestScore": {
           "type": "number"
+        },
+        "hostSelectedOption": {
+          "type": "number"
+        },
+        "guestSelectedOption": {
+          "type": "number"
+        },
+        "roundWinnerUid": {
+          "type": "string",
+          "maxLength": 128
         },
         "hostAnsweredRound": {
           "type": "number"
@@ -224,6 +243,94 @@
         "guestAnsweredRound",
         "hostReadyNextRound",
         "guestReadyNextRound",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "FriendRequest": {
+      "title": "FriendRequest",
+      "description": "Real-time cloud friend request between two players identified by their #ID",
+      "type": "object",
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "fromUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "fromPlayerId": {
+          "type": "string",
+          "maxLength": 16
+        },
+        "fromName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "fromFlag": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16
+        },
+        "fromRating": {
+          "type": "number"
+        },
+        "fromVipTier": {
+          "type": "string",
+          "enum": ["basic", "bronze", "silver", "royal_gold"]
+        },
+        "toPlayerId": {
+          "type": "string",
+          "maxLength": 16
+        },
+        "toUid": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "toName": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "toFlag": {
+          "type": "string",
+          "maxLength": 16
+        },
+        "toRating": {
+          "type": "number"
+        },
+        "toVipTier": {
+          "type": "string",
+          "enum": ["basic", "bronze", "silver", "royal_gold"]
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "accepted", "rejected"]
+        },
+        "timestamp": {
+          "type": "number"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "requestId",
+        "fromUid",
+        "fromPlayerId",
+        "fromName",
+        "fromFlag",
+        "toPlayerId",
+        "status",
+        "timestamp",
         "createdAt",
         "updatedAt"
       ]
@@ -295,6 +402,12 @@
         "$ref": "#/entities/PrivateRoom"
       },
       "description": "4-digit private challenge rooms and live match state"
+    },
+    "/friend_requests/{requestId}": {
+      "schema": {
+        "$ref": "#/entities/FriendRequest"
+      },
+      "description": "Real-time cloud friend requests and mutual friend acceptance"
     },
     "/messages/{messageId}": {
       "schema": {

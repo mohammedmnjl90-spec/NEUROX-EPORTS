@@ -81,8 +81,10 @@ service cloud.firestore {
       data.keys().hasOnly([
         'roomCode', 'hostUid', 'hostName', 'hostFlag', 'hostPlayerId',
         'guestUid', 'guestName', 'guestFlag', 'guestPlayerId',
-        'targetPlayerId', 'category', 'questionSeed', 'questionSeeds', 'status',
-        'hostScore', 'guestScore', 'hostAnsweredRound', 'guestAnsweredRound',
+        'targetPlayerId', 'category', 'questionSeed', 'questionSeeds', 'questionIds',
+        'currentRound', 'status',
+        'hostScore', 'guestScore', 'hostSelectedOption', 'guestSelectedOption',
+        'roundWinnerUid', 'hostAnsweredRound', 'guestAnsweredRound',
         'hostReadyNextRound', 'guestReadyNextRound',
         'createdAt', 'updatedAt'
       ]) &&
@@ -99,13 +101,48 @@ service cloud.firestore {
       data.category is string && data.category.size() >= 1 && data.category.size() <= 32 &&
       data.questionSeed is int && data.questionSeed >= 0 &&
       data.questionSeeds is list && data.questionSeeds.size() >= 1 && data.questionSeeds.size() <= 30 &&
+      (!('questionIds' in data) || (data.questionIds is list && data.questionIds.size() <= 30)) &&
+      (!('currentRound' in data) || (data.currentRound is int && data.currentRound >= 0 && data.currentRound <= 30)) &&
       data.status is string && data.status in ['waiting', 'active', 'finished', 'completed'] &&
       data.hostScore is int && data.hostScore >= 0 && data.hostScore <= 500 &&
       data.guestScore is int && data.guestScore >= 0 && data.guestScore <= 500 &&
+      (!('hostSelectedOption' in data) || (data.hostSelectedOption is int && data.hostSelectedOption >= -2 && data.hostSelectedOption <= 10)) &&
+      (!('guestSelectedOption' in data) || (data.guestSelectedOption is int && data.guestSelectedOption >= -2 && data.guestSelectedOption <= 10)) &&
+      (!('roundWinnerUid' in data) || (data.roundWinnerUid is string && data.roundWinnerUid.size() <= 128)) &&
       data.hostAnsweredRound is int && data.hostAnsweredRound >= 0 && data.hostAnsweredRound <= 100 &&
       data.guestAnsweredRound is int && data.guestAnsweredRound >= 0 && data.guestAnsweredRound <= 100 &&
       data.hostReadyNextRound is bool &&
       data.guestReadyNextRound is bool &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    function isValidFriendRequest(data) {
+      return data.keys().hasAll([
+        'requestId', 'fromUid', 'fromPlayerId', 'fromName', 'fromFlag',
+        'toPlayerId', 'status', 'timestamp', 'createdAt', 'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'requestId', 'fromUid', 'fromPlayerId', 'fromName', 'fromFlag',
+        'fromRating', 'fromVipTier',
+        'toPlayerId', 'toUid', 'toName', 'toFlag', 'toRating', 'toVipTier',
+        'status', 'timestamp', 'createdAt', 'updatedAt'
+      ]) &&
+      data.requestId is string && data.requestId.size() >= 1 && data.requestId.size() <= 128 && data.requestId.matches('^[a-zA-Z0-9_\\-]+$') &&
+      data.fromUid is string && data.fromUid.size() >= 1 && data.fromUid.size() <= 128 && data.fromUid.matches('^[a-zA-Z0-9_\\-]+$') &&
+      data.fromPlayerId is string && data.fromPlayerId.size() >= 2 && data.fromPlayerId.size() <= 16 &&
+      data.fromName is string && data.fromName.size() >= 1 && data.fromName.size() <= 32 &&
+      data.fromFlag is string && data.fromFlag.size() >= 1 && data.fromFlag.size() <= 16 &&
+      (!('fromRating' in data) || (data.fromRating is int && data.fromRating >= 0 && data.fromRating <= 1000000000)) &&
+      (!('fromVipTier' in data) || (data.fromVipTier is string && data.fromVipTier in ['basic', 'bronze', 'silver', 'royal_gold'])) &&
+      data.toPlayerId is string && data.toPlayerId.size() >= 2 && data.toPlayerId.size() <= 16 &&
+      (!('toUid' in data) || (data.toUid is string && data.toUid.size() <= 128)) &&
+      (!('toName' in data) || (data.toName is string && data.toName.size() <= 32)) &&
+      (!('toFlag' in data) || (data.toFlag is string && data.toFlag.size() <= 16)) &&
+      (!('toRating' in data) || (data.toRating is int && data.toRating >= 0 && data.toRating <= 1000000000)) &&
+      (!('toVipTier' in data) || (data.toVipTier is string && data.toVipTier in ['basic', 'bronze', 'silver', 'royal_gold'])) &&
+      data.status is string && data.status in ['pending', 'accepted', 'rejected'] &&
+      data.timestamp is int && data.timestamp >= 0 &&
       data.createdAt is timestamp &&
       data.updatedAt is timestamp;
     }
@@ -208,36 +245,60 @@ service cloud.firestore {
 
       allow update: if isValidId(roomId) &&
         isValidPrivateRoom(incoming()) &&
-        !(existing().status in ['completed', 'finished']) &&
         incoming().roomCode == existing().roomCode &&
         incoming().hostUid == existing().hostUid &&
-        incoming().hostName == existing().hostName &&
-        incoming().hostFlag == existing().hostFlag &&
-        incoming().category == existing().category &&
-        incoming().questionSeed == existing().questionSeed &&
         incoming().createdAt == existing().createdAt &&
         incoming().updatedAt == request.time && (
-          // Action 1: Guest Joins Waiting Room
+          // Action 1: Guest Joins Waiting Room or Host Refreshes Waiting Room
           (
             existing().status == 'waiting' &&
-            incoming().status == 'active' &&
+            incoming().status in ['waiting', 'active'] &&
             incoming().diff(existing()).affectedKeys().hasOnly([
-              'guestUid', 'guestName', 'guestFlag', 'guestPlayerId', 'status', 'updatedAt'
+              'guestUid', 'guestName', 'guestFlag', 'guestPlayerId',
+              'targetPlayerId', 'questionIds', 'currentRound',
+              'hostSelectedOption', 'guestSelectedOption', 'roundWinnerUid',
+              'status', 'updatedAt'
             ])
           ) ||
-          // Action 2: Host or Guest Updates Score / Answered Round / Readiness / Finished
+          // Action 2: Host or Guest Updates Live Match State (Round, Selected Option, Score, Readiness, Finished)
           (
-            incoming().guestUid == existing().guestUid &&
-            incoming().guestName == existing().guestName &&
-            incoming().guestFlag == existing().guestFlag &&
             incoming().diff(existing()).affectedKeys().hasOnly([
+              'currentRound', 'questionIds',
               'hostScore', 'guestScore',
+              'hostSelectedOption', 'guestSelectedOption',
+              'roundWinnerUid',
               'hostAnsweredRound', 'guestAnsweredRound',
               'hostReadyNextRound', 'guestReadyNextRound',
               'status', 'updatedAt'
             ])
           )
         );
+
+      allow delete: if false;
+    }
+
+    match /friend_requests/{requestId} {
+      allow get: if isValidId(requestId);
+      allow list: if resource.data.status in ['pending', 'accepted', 'rejected'];
+
+      allow create: if isValidId(requestId) &&
+        isValidFriendRequest(incoming()) &&
+        incoming().requestId == requestId &&
+        incoming().status in ['pending', 'accepted'] &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isValidId(requestId) &&
+        isValidFriendRequest(incoming()) &&
+        incoming().requestId == existing().requestId &&
+        incoming().fromUid == existing().fromUid &&
+        incoming().fromPlayerId == existing().fromPlayerId &&
+        incoming().toPlayerId == existing().toPlayerId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'status', 'toUid', 'toName', 'toFlag', 'toRating', 'toVipTier', 'timestamp', 'updatedAt'
+        ]);
 
       allow delete: if false;
     }

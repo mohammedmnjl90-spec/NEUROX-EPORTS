@@ -582,6 +582,34 @@ export function getMatchQuestions(
   return shuffled.slice(0, count).map(q => shuffleQuestionOptions(q, rand));
 }
 
+export function getMatchQuestionsByIds(
+  category: CategoryId,
+  questionIds: string[],
+  customSeed?: number,
+  questionSeeds?: number[]
+): QuizQuestion[] {
+  if (!Array.isArray(questionIds) || questionIds.length === 0) {
+    return getMatchQuestions(category, 25, [], customSeed, questionSeeds);
+  }
+  const byId = new Map<string, QuizQuestion>();
+  for (const q of FULL_QUESTION_BANK) {
+    byId.set(q.id, q);
+  }
+  const baseSeed = Math.abs(Math.floor(customSeed || 7919));
+  const resolved: QuizQuestion[] = [];
+  for (let i = 0; i < questionIds.length; i++) {
+    const qId = questionIds[i];
+    const found = byId.get(qId) || FULL_QUESTION_BANK[i % FULL_QUESTION_BANK.length];
+    const seedVal =
+      Array.isArray(questionSeeds) && questionSeeds[i] !== undefined
+        ? Math.abs(Math.floor(Number(questionSeeds[i]) || i + 1))
+        : baseSeed + i * 131;
+    const optRand = createSeededRandom(seedVal + i * 97 + 13);
+    resolved.push(shuffleQuestionOptions(found, optRand));
+  }
+  return resolved;
+}
+
 export function getDailyBossQuestion(dateStr: string): QuizQuestion {
   let seed = 0;
   for (let i = 0; i < dateStr.length; i++) {

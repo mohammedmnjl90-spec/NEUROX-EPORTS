@@ -22,13 +22,16 @@ import {
 import {
   createCloudPrivateRoom,
   joinCloudPrivateRoom,
+  respondToCloudFriendRequest,
   setFirestoreOnlineMode,
+  subscribeToCloudFriendRequests,
   subscribeToIncomingCloudChallenges,
   subscribeToMyCloudProfileUpdates,
 } from './services/firebase';
 import {
   CategoryId,
   ChallengeNotificationItem,
+  CloudFriendRequestItem,
   FriendItem,
   GameMode,
   HourlyAdConfig,
@@ -73,6 +76,7 @@ import {
   ShoppingBag,
   Swords,
   Trophy,
+  UserPlus,
   Users,
   Wifi,
   WifiOff,
@@ -224,11 +228,92 @@ type ActiveTab =
   | 'settings'
   | 'help';
 
-export default function App() {
+function normalizeAccountSafe(raw: PlayerAccount): PlayerAccount {
+  const base = sanitizePlayerAccount(raw);
+  return {
+    ...base,
+    friends: Array.isArray(base.friends) ? base.friends : [],
+    xp: Number(base.xp) || 0,
+    coins:
+      base.coins !== undefined && !Number.isNaN(Number(base.coins))
+        ? Number(base.coins)
+        : 500,
+    language: base.language || 'ar',
+    equippedTheme: base.equippedTheme || 'midnight_cyan',
+    equippedBorder: base.equippedBorder || 'default_cyan',
+  };
+}
+
+interface AppErrorBoundaryState {
+  hasError: boolean;
+}
+
+class AppErrorBoundary extends React.Component<
+  { children: React.ReactNode },
+  AppErrorBoundaryState
+> {
+  constructor(props: { children: React.ReactNode }) {
+    super(props);
+    this.state = { hasError: false };
+  }
+
+  static getDerivedStateFromError(): AppErrorBoundaryState {
+    return { hasError: true };
+  }
+
+  componentDidCatch(error: unknown) {
+    console.error('AppErrorBoundary caught render error:', error);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div
+          dir="rtl"
+          className="min-h-screen bg-[#070A12] text-white flex flex-col items-center justify-center p-6 text-center"
+        >
+          <div className="w-full max-w-md rounded-3xl bg-[#111827] border-2 border-[#4FF5D2] p-6 shadow-2xl space-y-4">
+            <div className="text-4xl">🛡️</div>
+            <h2 className="text-lg font-extrabold text-white">
+              تم تأمين حسابك واستعادة الواجهة بنجاح
+            </h2>
+            <p className="text-xs text-slate-300 leading-relaxed">
+              حدث خطأ عارض أثناء رسم الشاشة، وتم حفظ كافة بيانات حسابك وعملاتك بأمان.
+            </p>
+            <button
+              type="button"
+              onClick={() => {
+                try {
+                  const active = getActiveAccount();
+                  if (active) {
+                    const safe = normalizeAccountSafe(active);
+                    setActiveAccountUid(safe.uid);
+                    persistUpdatedAccount(safe);
+                  }
+                } catch {}
+                this.setState({ hasError: false });
+              }}
+              className="w-full min-h-[46px] rounded-2xl bg-gradient-to-r from-[#4FF5D2] to-[#38D9A9] text-[#070A12] font-extrabold text-xs shadow-lg"
+            >
+              متابعة الدخول للساحة الرئيسية ⚡
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+function AppContent() {
   const [showSplash, setShowSplash] = useState<boolean>(true);
   const [account, setAccount] = useState<PlayerAccount | null>(() => {
-    const active = getActiveAccount();
-    return active ? sanitizePlayerAccount(active) : null;
+    try {
+      const active = getActiveAccount();
+      return active ? normalizeAccountSafe(active) : null;
+    } catch {
+      return null;
+    }
   });
   const [activeTab, setActiveTab] = useState<ActiveTab>('arena');
 
@@ -267,13 +352,21 @@ export default function App() {
   const [copiedId, setCopiedId] = useState<boolean>(false);
   const [showExitConfirmModal, setShowExitConfirmModal] = useState<boolean>(false);
 
-  // Local Notifications & Incoming Friend Challenge Invites State
+  // Local Notifications, Incoming Friend Challenge Invites & Cloud Friend Requests State
   const [notifications, setNotifications] = useState<ChallengeNotificationItem[]>(
     () => loadStoredChallengeNotifications()
   );
   const [notifDrawerOpen, setNotifDrawerOpen] = useState<boolean>(false);
   const [activeIncomingBanner, setActiveIncomingBanner] =
     useState<ChallengeNotificationItem | null>(null);
+  const [incomingFriendRequests, setIncomingFriendRequests] = useState<
+    CloudFriendRequestItem[]
+  >([]);
+  const [activeFriendRequestBanner, setActiveFriendRequestBanner] =
+    useState<CloudFriendRequestItem | null>(null);
+  const seenFriendRequestIdsRef = useRef<Set<string>>(new Set());
+  const accountRef = useRef<PlayerAccount | null>(account);
+  accountRef.current = account;
   const [notifPermission, setNotifPermission] = useState<string>(() =>
     getLocalNotificationPermission()
   );
@@ -314,28 +407,38 @@ export default function App() {
   // Real-time Firestore listener for 1-Click VIP / Coins / Ban updates from Owner Control Panel
   useEffect(() => {
     if (!account || !isOnline) return;
-    const unsub = subscribeToMyCloudProfileUpdates(account, remotePatch => {
-      const nextAcc: PlayerAccount = sanitizePlayerAccount({
-        ...account,
-        ...remotePatch,
-        updatedAt: Date.now(),
+    let unsub: (() => void) | undefined;
+    try {
+      unsub = subscribeToMyCloudProfileUpdates(account, remotePatch => {
+        try {
+          const currentAcc = accountRef.current || account;
+          const nextAcc: PlayerAccount = normalizeAccountSafe({
+            ...currentAcc,
+            ...remotePatch,
+            updatedAt: Date.now(),
+          });
+          const res = persistUpdatedAccount(nextAcc);
+          setAccount({ ...res.account });
+          if (remotePatch.vipTier && remotePatch.vipTier !== currentAcc.vipTier) {
+            const pkg = VIP_PACKAGES.find(p => p.id === remotePatch.vipTier);
+            if (pkg && pkg.id !== 'basic') {
+              savePlaytimeSeconds(currentAcc.uid, 0);
+              setPlaytimeSeconds(0);
+              setHourlyAdModalOpen(false);
+              showToast(
+                `👑 تم تفعيل ${pkg.nameAr} ${pkg.badge} في حسابك وإيقاف الإعلانات التلقائية فوراً!`
+              );
+            }
+          }
+        } catch {}
       });
-      const res = persistUpdatedAccount(nextAcc);
-      setAccount({ ...res.account });
-      if (remotePatch.vipTier && remotePatch.vipTier !== account.vipTier) {
-        const pkg = VIP_PACKAGES.find(p => p.id === remotePatch.vipTier);
-        if (pkg && pkg.id !== 'basic') {
-          savePlaytimeSeconds(account.uid, 0);
-          setPlaytimeSeconds(0);
-          setHourlyAdModalOpen(false);
-          showToast(
-            `👑 تم تفعيل ${pkg.nameAr} ${pkg.badge} في حسابك وإيقاف الإعلانات التلقائية فوراً!`
-          );
-        }
-      }
-    });
-    return () => unsub();
-  }, [account, isOnline]);
+    } catch {}
+    return () => {
+      try {
+        if (unsub) unsub();
+      } catch {}
+    };
+  }, [account?.uid, account?.playerId, isOnline]);
 
   // Background Hourly Playtime Tracker (60 minutes = 3600 seconds)
   // Exempts VIP subscribers (bronze, silver, royal_gold) and never interrupts an active match
@@ -674,63 +777,207 @@ export default function App() {
     joinCloudPrivateRoom(invite.roomCode, account).catch(() => {});
   };
 
+  const handleAcceptCloudFriendRequest = async (req: CloudFriendRequestItem) => {
+    const currentAcc = accountRef.current;
+    if (!currentAcc) return;
+    soundFX.playCorrect();
+    setActiveFriendRequestBanner(prev =>
+      prev?.requestId === req.requestId ? null : prev
+    );
+    setIncomingFriendRequests(prev =>
+      prev.filter(item => item.requestId !== req.requestId)
+    );
+
+    const safeFriends = Array.isArray(currentAcc.friends)
+      ? [...currentAcc.friends]
+      : [];
+    const existsIdx = safeFriends.findIndex(
+      f => f.playerId === req.fromPlayerId || (req.fromUid && f.uid === req.fromUid)
+    );
+    const friendObj: FriendItem = {
+      uid: req.fromUid || `cloud_${req.fromPlayerId}`,
+      playerId: req.fromPlayerId,
+      username: req.fromName || 'لاعب',
+      countryFlag: req.fromFlag || '🇸🇦',
+      rating: req.fromRating || 1200,
+      vipTier: req.fromVipTier || 'basic',
+      addedAt: Date.now(),
+      presenceStatus: 'online',
+      sportsmanshipAvg: 5.0,
+      sportsmanshipCount: 1,
+    };
+    if (existsIdx >= 0) {
+      safeFriends[existsIdx] = { ...safeFriends[existsIdx], ...friendObj };
+    } else {
+      safeFriends.unshift(friendObj);
+    }
+
+    handleAccountMutation(
+      {
+        ...currentAcc,
+        friends: safeFriends,
+        updatedAt: Date.now(),
+      },
+      `🤝 تم قبول صداقة ${req.fromName} (${req.fromPlayerId}) وإضافته لقائمة أصدقائك فوراً!`
+    );
+
+    try {
+      await respondToCloudFriendRequest(req.requestId, currentAcc, 'accepted');
+    } catch {}
+  };
+
+  const handleRejectCloudFriendRequest = async (req: CloudFriendRequestItem) => {
+    const currentAcc = accountRef.current;
+    if (!currentAcc) return;
+    soundFX.playClick();
+    setActiveFriendRequestBanner(prev =>
+      prev?.requestId === req.requestId ? null : prev
+    );
+    setIncomingFriendRequests(prev =>
+      prev.filter(item => item.requestId !== req.requestId)
+    );
+    try {
+      await respondToCloudFriendRequest(req.requestId, currentAcc, 'rejected');
+    } catch {}
+  };
+
+  // Real-time Cloud Friend Requests Listener (`friend_requests` collection via `onSnapshot`)
+  useEffect(() => {
+    if (!account || !isOnline) return;
+    let unsubFriends: (() => void) | undefined;
+    try {
+      unsubFriends = subscribeToCloudFriendRequests(account, {
+        onIncomingPending: pendingList => {
+          setIncomingFriendRequests(pendingList);
+          for (const req of pendingList) {
+            if (!seenFriendRequestIdsRef.current.has(req.requestId)) {
+              seenFriendRequestIdsRef.current.add(req.requestId);
+              soundFX.playCorrect();
+              setActiveFriendRequestBanner(req);
+              break;
+            }
+          }
+        },
+        onMutualFriendAccepted: acceptedFriend => {
+          const currentAcc = accountRef.current;
+          if (!currentAcc) return;
+          const existingList = Array.isArray(currentAcc.friends)
+            ? currentAcc.friends
+            : [];
+          if (
+            existingList.some(
+              f =>
+                f.playerId === acceptedFriend.playerId ||
+                (acceptedFriend.uid && f.uid === acceptedFriend.uid)
+            )
+          ) {
+            return;
+          }
+          const updatedFriends = [acceptedFriend, ...existingList];
+          const nextAcc = normalizeAccountSafe({
+            ...currentAcc,
+            friends: updatedFriends,
+            updatedAt: Date.now(),
+          });
+          const persisted = persistUpdatedAccount(nextAcc);
+          setAccount({ ...persisted.account });
+          soundFX.playCorrect();
+          showToast(
+            `🎉 قبل ${acceptedFriend.username} (${acceptedFriend.playerId}) طلب الصداقة وأصبح في قائمة أصدقائك الآن!`
+          );
+        },
+      });
+    } catch {}
+    return () => {
+      try {
+        if (unsubFriends) unsubFriends();
+      } catch {}
+    };
+  }, [account?.uid, account?.playerId, isOnline]);
+
   // Real-time Incoming Challenge Listeners (Firestore Waiting Rooms + Cross-Tab BroadcastChannel)
   useEffect(() => {
     if (!account || !isOnline) return;
     if (account.localNotificationsEnabled === false) return;
 
     const handleReceiveInvite = (invite: ChallengeNotificationItem) => {
-      setNotifications(prev => {
-        if (prev.some(p => p.roomCode === invite.roomCode && !invite.id.startsWith('test_'))) {
-          return prev;
-        }
-        const next = [invite, ...prev].slice(0, 25);
-        saveStoredChallengeNotifications(next);
-        return next;
-      });
-      setActiveIncomingBanner(invite);
-      triggerLocalChallengeNotification(invite, handleAcceptChallengeNotification);
+      try {
+        setNotifications(prev => {
+          if (
+            prev.some(
+              p => p.roomCode === invite.roomCode && !invite.id.startsWith('test_')
+            )
+          ) {
+            return prev;
+          }
+          const next = [invite, ...prev].slice(0, 25);
+          saveStoredChallengeNotifications(next);
+          return next;
+        });
+        soundFX.playCorrect();
+        setActiveIncomingBanner(invite);
+        triggerLocalChallengeNotification(
+          invite,
+          handleAcceptChallengeNotification
+        );
+      } catch {}
     };
 
-    const unsubCloud = subscribeToIncomingCloudChallenges(
-      account,
-      (roomCode, hostUid, hostName, hostFlag, category, hostPlayerId) => {
-        // Check if this challenger is already in friends list or a new challenger
-        const matchedFriend = (account.friends || []).find(
-          f =>
-            f.uid === hostUid ||
-            (hostPlayerId && f.playerId === hostPlayerId) ||
-            (f.username || '').toLowerCase() === hostName.toLowerCase()
-        );
-        const invite: ChallengeNotificationItem = {
-          id: `cloud_inv_${roomCode}_${Date.now()}`,
-          roomCode,
-          category: (category as CategoryId) || 'cocktail',
-          senderUid: hostUid,
-          senderPlayerId:
-            matchedFriend?.playerId || hostPlayerId || '#لاعب_سحابي',
-          senderName: hostName,
-          senderFlag: hostFlag,
-          timestamp: Date.now(),
-          read: false,
-        };
-        handleReceiveInvite(invite);
-      }
-    );
+    let unsubCloud: (() => void) | undefined;
+    let unsubLocal: (() => void) | undefined;
 
-    const unsubLocal = subscribeToLocalChallengeBroadcasts(
-      account.playerId,
-      account.uid,
-      invite => {
-        handleReceiveInvite(invite);
-      }
-    );
+    try {
+      unsubCloud = subscribeToIncomingCloudChallenges(
+        account,
+        (roomCode, hostUid, hostName, hostFlag, category, hostPlayerId) => {
+          try {
+            const currentAcc = accountRef.current || account;
+            const friendsList = Array.isArray(currentAcc.friends)
+              ? currentAcc.friends
+              : [];
+            const matchedFriend = friendsList.find(
+              f =>
+                f.uid === hostUid ||
+                (hostPlayerId && f.playerId === hostPlayerId) ||
+                (f.username || '').toLowerCase() === hostName.toLowerCase()
+            );
+            const invite: ChallengeNotificationItem = {
+              id: `cloud_inv_${roomCode}_${Date.now()}`,
+              roomCode,
+              category: (category as CategoryId) || 'cocktail',
+              senderUid: hostUid,
+              senderPlayerId:
+                matchedFriend?.playerId || hostPlayerId || '#لاعب_سحابي',
+              senderName: hostName,
+              senderFlag: hostFlag,
+              timestamp: Date.now(),
+              read: false,
+            };
+            handleReceiveInvite(invite);
+          } catch {}
+        }
+      );
+    } catch {}
+
+    try {
+      unsubLocal = subscribeToLocalChallengeBroadcasts(
+        account.playerId,
+        account.uid,
+        invite => {
+          handleReceiveInvite(invite);
+        }
+      );
+    } catch {}
 
     return () => {
-      unsubCloud();
-      unsubLocal();
+      try {
+        if (unsubCloud) unsubCloud();
+      } catch {}
+      try {
+        if (unsubLocal) unsubLocal();
+      } catch {}
     };
-  }, [account, isOnline]);
+  }, [account?.uid, account?.playerId, account?.localNotificationsEnabled, isOnline]);
 
   const handleTriggerBackgroundTestNotification = async (delaySeconds = 3) => {
     if (!account) return;
@@ -847,14 +1094,14 @@ export default function App() {
             setSelectedMode(prev => (prev === 'solo' ? 'online' : prev));
           }
           if (result?.accountPatch && account) {
-            const merged = sanitizePlayerAccount({
+            const merged = normalizeAccountSafe({
               ...account,
               ...result.accountPatch,
               updatedAt: Date.now(),
             });
             setActiveAccountUid(merged.uid);
             const res = persistUpdatedAccount(merged);
-            setAccount({ ...res.account });
+            setAccount({ ... normalizeAccountSafe(res.account) });
           }
           showSplashRef.current = false;
           setShowSplash(false);
@@ -868,12 +1115,29 @@ export default function App() {
     return (
       <AuthScreen
         onSuccess={loggedInAccount => {
-          const safeAcc = sanitizePlayerAccount(loggedInAccount);
-          setActiveAccountUid(safeAcc.uid);
-          const persisted = persistUpdatedAccount(safeAcc);
-          setAccount({ ...persisted.account });
+          const initializedAcc: PlayerAccount = normalizeAccountSafe({
+            ...loggedInAccount,
+            friends: Array.isArray(loggedInAccount.friends)
+              ? loggedInAccount.friends
+              : [],
+            xp: Number(loggedInAccount.xp) || 0,
+            coins:
+              loggedInAccount.coins !== undefined &&
+              !Number.isNaN(Number(loggedInAccount.coins))
+                ? Number(loggedInAccount.coins)
+                : 500,
+            language: loggedInAccount.language || 'ar',
+            equippedTheme: loggedInAccount.equippedTheme || 'midnight_cyan',
+            equippedBorder: loggedInAccount.equippedBorder || 'default_cyan',
+          });
+          setActiveAccountUid(initializedAcc.uid);
+          const persisted = persistUpdatedAccount(initializedAcc);
+          const finalAcc = normalizeAccountSafe(persisted.account);
+          setAccount({ ...finalAcc });
+          showSplashRef.current = false;
+          setShowSplash(false);
           showToast(
-            `مرحباً بك في الساحة يا ${persisted.account.username} ${persisted.account.countryFlag}!`
+            `مرحباً بك في الساحة يا ${finalAcc.username} ${finalAcc.countryFlag}!`
           );
         }}
       />
@@ -1012,14 +1276,18 @@ export default function App() {
               title={t.notifCenterTitle}
               aria-label={t.notifCenterTitle}
             >
-              {notifications.some(n => !n.read) ? (
+              {notifications.some(n => !n.read) ||
+              incomingFriendRequests.length > 0 ? (
                 <BellRing className="w-4 h-4 animate-bounce text-[#FFD166]" />
               ) : (
                 <Bell className="w-4 h-4" />
               )}
-              {notifications.filter(n => !n.read).length > 0 && (
+              {notifications.filter(n => !n.read).length +
+                incomingFriendRequests.length >
+                0 && (
                 <span className="absolute -top-1.5 -right-1.5 min-w-[18px] h-[18px] px-1 rounded-full bg-[#FF6B81] text-[#070A12] text-[10px] font-mono-num font-extrabold flex items-center justify-center">
-                  {notifications.filter(n => !n.read).length}
+                  {notifications.filter(n => !n.read).length +
+                    incomingFriendRequests.length}
                 </span>
               )}
             </button>
@@ -1045,7 +1313,63 @@ export default function App() {
         </header>
       )}
 
-      {/* Incoming Friend Challenge Alert Banner (Real-Time Local Notification Overlay) */}
+      {/* Incoming Cloud Friend Request Pop-Up Alert Banner */}
+      {activeFriendRequestBanner && !activeMatch && (
+        <div
+          dir="rtl"
+          className="fixed top-16 left-1/2 -translate-x-1/2 z-50 w-[94%] max-w-lg rounded-3xl bg-[#111827] border-2 border-[#FFD166] p-4 shadow-[0_0_45px_rgba(255,209,102,0.35)]"
+        >
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex items-center gap-3">
+              <div className="w-12 h-12 rounded-2xl bg-[#1B253B] border border-[#FFD166] flex items-center justify-center text-2xl shrink-0">
+                {activeFriendRequestBanner.fromFlag || '🇸🇦'}
+              </div>
+              <div>
+                <div className="flex items-center gap-1.5 text-xs font-extrabold text-[#FFD166]">
+                  <UserPlus className="w-3.5 h-3.5" />
+                  <span>طلب صداقة جديد وارد!</span>
+                </div>
+                <div className="text-sm font-extrabold text-white mt-0.5">
+                  لديك طلب صداقة جديد من {activeFriendRequestBanner.fromName}{' '}
+                  <span className="text-[11px] font-mono-num text-[#4FF5D2]">
+                    ({activeFriendRequestBanner.fromPlayerId})
+                  </span>
+                </div>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => setActiveFriendRequestBanner(null)}
+              className="text-slate-400 hover:text-white text-xs px-2 py-1"
+            >
+              ✕
+            </button>
+          </div>
+          <div className="flex items-center gap-2.5 mt-3">
+            <button
+              type="button"
+              onClick={() =>
+                handleAcceptCloudFriendRequest(activeFriendRequestBanner)
+              }
+              className="flex-1 min-h-[42px] rounded-xl bg-gradient-to-r from-[#4FF5D2] to-[#38D9A9] text-[#070A12] font-extrabold text-xs flex items-center justify-center gap-1.5 shadow-lg"
+            >
+              <UserPlus className="w-4 h-4" />
+              <span>قبول وإضافة للصداقة فوراً ✓</span>
+            </button>
+            <button
+              type="button"
+              onClick={() =>
+                handleRejectCloudFriendRequest(activeFriendRequestBanner)
+              }
+              className="min-h-[42px] px-4 rounded-xl bg-[#FF6B81]/20 hover:bg-[#FF6B81]/30 border border-[#FF6B81]/50 text-xs font-bold text-[#FF6B81]"
+            >
+              رفض ✕
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Incoming Friend Challenge Alert Banner (Real-Time Local & Cloud Notification Overlay) */}
       {activeIncomingBanner && !activeMatch && (
         <div className="fixed top-16 left-1/2 -translate-x-1/2 z-50 w-[94%] max-w-lg rounded-3xl bg-[#111827] border-2 border-[#4FF5D2] p-4 shadow-[0_0_40px_rgba(79,245,210,0.3)] animate-pulse">
           <div className="flex items-start justify-between gap-3">
@@ -1229,6 +1553,9 @@ export default function App() {
             account={account}
             onUpdateAccount={handleAccountMutation}
             onChallengeFriend={handleChallengeFriend}
+            incomingFriendRequests={incomingFriendRequests}
+            onAcceptFriendRequest={handleAcceptCloudFriendRequest}
+            onRejectFriendRequest={handleRejectCloudFriendRequest}
             onStartDirectChallenge={(friend, roomCode, category) => {
               setActiveMatch({
                 mode: 'room',
@@ -2197,3 +2524,12 @@ export default function App() {
     </div>
   );
 }
+
+export default function App() {
+  return (
+    <AppErrorBoundary>
+      <AppContent />
+    </AppErrorBoundary>
+  );
+}
+

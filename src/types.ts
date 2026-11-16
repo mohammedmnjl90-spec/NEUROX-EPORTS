@@ -128,6 +128,24 @@ export interface ChallengeNotificationItem {
   read: boolean;
 }
 
+export interface CloudFriendRequestItem {
+  requestId: string;
+  fromUid: string;
+  fromPlayerId: string;
+  fromName: string;
+  fromFlag: string;
+  fromRating: number;
+  fromVipTier: VipTier;
+  toPlayerId: string;
+  toUid?: string;
+  toName?: string;
+  toFlag?: string;
+  toRating?: number;
+  toVipTier?: VipTier;
+  status: 'pending' | 'accepted' | 'rejected';
+  timestamp: number;
+}
+
 export interface DailyMissionProgress {
   dateStr: string;
   onlineWins: number;

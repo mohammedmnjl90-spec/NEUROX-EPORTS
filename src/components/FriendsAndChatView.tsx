@@ -3,7 +3,10 @@ import { QUIZ_CATEGORIES, VIP_PACKAGES } from '../data/constants';
 import {
   findCloudPlayerByIdentifier,
   FriendRealtimePresence,
+  respondToCloudFriendRequest,
+  sendCloudFriendRequest,
   sendQuickChallengeInvite,
+  subscribeToCloudFriendRequests,
   subscribeToCloudRoom,
   subscribeToFriendsPresence,
   syncPlayerToCloud,
@@ -16,6 +19,7 @@ import {
 import {
   CategoryId,
   ChatMessageItem,
+  CloudFriendRequestItem,
   FriendItem,
   FriendPresenceStatus,
   LanguageCode,
@@ -251,6 +255,9 @@ interface FriendsAndChatViewProps {
     roomCode: string,
     category: CategoryId
   ) => void;
+  incomingFriendRequests?: CloudFriendRequestItem[];
+  onAcceptFriendRequest?: (req: CloudFriendRequestItem) => void;
+  onRejectFriendRequest?: (req: CloudFriendRequestItem) => void;
 }
 
 export const FriendsAndChatView: React.FC<FriendsAndChatViewProps> = ({
@@ -258,6 +265,9 @@ export const FriendsAndChatView: React.FC<FriendsAndChatViewProps> = ({
   onUpdateAccount,
   onChallengeFriend,
   onStartDirectChallenge,
+  incomingFriendRequests,
+  onAcceptFriendRequest,
+  onRejectFriendRequest,
 }) => {
   const t = getTranslations(account.language);
   const p = PRESENCE_I18N[account.language] || PRESENCE_I18N.ar;
@@ -265,6 +275,10 @@ export const FriendsAndChatView: React.FC<FriendsAndChatViewProps> = ({
   const [searchQuery, setSearchQuery] = useState('');
   const [searchingCloud, setSearchingCloud] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
+  const [searchSuccessInfo, setSearchSuccessInfo] = useState<string | null>(null);
+  const [localPendingRequests, setLocalPendingRequests] = useState<
+    CloudFriendRequestItem[]
+  >([]);
   const [copiedMyId, setCopiedMyId] = useState(false);
   const [stealthOwnerOpen, setStealthOwnerOpen] = useState(false);
   const [statusFilter, setStatusFilter] = useState<
@@ -330,6 +344,92 @@ export const FriendsAndChatView: React.FC<FriendsAndChatViewProps> = ({
     if (!navigator.onLine) return;
     syncPlayerToCloud(account).catch(() => {});
   }, [account.uid]);
+
+  const accountRef = useRef<PlayerAccount>(account);
+  accountRef.current = account;
+
+  // Subscribe in real-time to Firestore `friend_requests` inside FriendsAndChatView as well
+  useEffect(() => {
+    if (typeof navigator !== 'undefined' && !navigator.onLine) return;
+    try {
+      const unsub = subscribeToCloudFriendRequests(accountRef.current, {
+        onIncomingPending: pendingList => {
+          setLocalPendingRequests(pendingList);
+        },
+        onMutualFriendAccepted: newFriend => {
+          const currAcc = accountRef.current;
+          const currFriends = Array.isArray(currAcc.friends) ? currAcc.friends : [];
+          const exists = currFriends.some(
+            f => f.playerId.toLowerCase() === newFriend.playerId.toLowerCase()
+          );
+          if (!exists) {
+            const nextFriends = [newFriend, ...currFriends];
+            setActiveFriend(prev => prev || newFriend);
+            onUpdateAccount(
+              {
+                ...currAcc,
+                friends: nextFriends,
+              },
+              `🤝 تم قبول طلب الصداقة! أُضيف ${newFriend.username} (${newFriend.playerId}) تلقائياً لقائمة أصدقائك!`
+            );
+          }
+        },
+      });
+      return () => unsub();
+    } catch {
+      return;
+    }
+  }, [account.playerId]);
+
+  const effectivePendingRequests =
+    incomingFriendRequests && incomingFriendRequests.length > 0
+      ? incomingFriendRequests
+      : localPendingRequests;
+
+  const handleAcceptRequestInternal = async (req: CloudFriendRequestItem) => {
+    soundFX.playCorrect(false, 2);
+    if (onAcceptFriendRequest) {
+      onAcceptFriendRequest(req);
+      return;
+    }
+    await respondToCloudFriendRequest(req.requestId, account, 'accepted').catch(
+      () => false
+    );
+    const newFriend: FriendItem = {
+      uid: req.fromUid,
+      playerId: req.fromPlayerId,
+      username: req.fromName,
+      countryFlag: req.fromFlag || '🇸🇦',
+      rating: req.fromRating || 1200,
+      vipTier: req.fromVipTier || 'basic',
+      addedAt: Date.now(),
+      isFavorite: true,
+      presenceStatus: 'online',
+    };
+    const exists = realFriends.some(
+      f => f.playerId.toLowerCase() === newFriend.playerId.toLowerCase()
+    );
+    const nextFriends = exists ? realFriends : [newFriend, ...realFriends];
+    setActiveFriend(newFriend);
+    onUpdateAccount(
+      { ...account, friends: nextFriends },
+      `🤝 قبلت طلب الصداقة من ${req.fromName} (${req.fromPlayerId}) وتم ربط الصداقة في الجوالين معاً!`
+    );
+  };
+
+  const handleRejectRequestInternal = async (req: CloudFriendRequestItem) => {
+    soundFX.playClick();
+    if (onRejectFriendRequest) {
+      onRejectFriendRequest(req);
+      return;
+    }
+    await respondToCloudFriendRequest(req.requestId, account, 'rejected').catch(
+      () => false
+    );
+    setLocalPendingRequests(prev =>
+      prev.filter(r => r.requestId !== req.requestId)
+    );
+  };
 
   // Subscribe in real-time to Firestore `players` and `rooms` for friend status (نشط، في مباراة، خارج اللعبة)
   // and detect when a Favorite Friend transitions from 'offline' -> 'online'
@@ -595,6 +695,7 @@ export const FriendsAndChatView: React.FC<FriendsAndChatViewProps> = ({
     e.preventDefault();
     soundFX.playClick();
     setSearchError(null);
+    setSearchSuccessInfo(null);
 
     if (isStealthOwnerTriggerMatch(searchQuery)) {
       setSearchQuery('');
@@ -605,27 +706,29 @@ export const FriendsAndChatView: React.FC<FriendsAndChatViewProps> = ({
     const q = searchQuery.trim();
     if (!q) return;
 
-    if (!navigator.onLine) {
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
       soundFX.playWrong();
       setSearchError(t.requiresInternet);
       return;
     }
 
+    const normalizedSearchId = q.startsWith('#') ? q : `#${q}`;
+
     if (
       q.toLowerCase() === account.username.toLowerCase() ||
-      q === account.playerId ||
-      `#${q}` === account.playerId
+      q.toLowerCase() === account.playerId.toLowerCase() ||
+      normalizedSearchId.toLowerCase() === account.playerId.toLowerCase()
     ) {
       soundFX.playWrong();
-      setSearchError('لا يمكنك إضافة حسابك الشخصي كصديق!');
+      setSearchError('لا يمكنك إرسال طلب صداقة لحسابك الشخصي!');
       return;
     }
 
     const alreadyExists = realFriends.some(
       f =>
         f.username.toLowerCase() === q.toLowerCase() ||
-        f.playerId === q ||
-        f.playerId === `#${q}`
+        f.playerId.toLowerCase() === q.toLowerCase() ||
+        f.playerId.toLowerCase() === normalizedSearchId.toLowerCase()
     );
     if (alreadyExists) {
       soundFX.playWrong();
@@ -640,57 +743,53 @@ export const FriendsAndChatView: React.FC<FriendsAndChatViewProps> = ({
       const foundLocal = localRegistry.find(
         pl =>
           pl.username.toLowerCase() === q.toLowerCase() ||
-          pl.playerId === q ||
-          pl.playerId === `#${q}`
+          pl.playerId.toLowerCase() === q.toLowerCase() ||
+          pl.playerId.toLowerCase() === normalizedSearchId.toLowerCase()
       );
 
-      let newFriend: FriendItem | null = null;
+      const isExplicitIdFormat = /^#?[0-9]{4,12}$/.test(q);
+      const targetPlayerId =
+        cloudPlayer?.playerId ||
+        foundLocal?.playerId ||
+        (isExplicitIdFormat ? (q.startsWith('#') ? q : `#${q}`) : '');
 
-      if (cloudPlayer) {
-        newFriend = {
-          uid: cloudPlayer.uid,
-          playerId: cloudPlayer.playerId,
-          username: cloudPlayer.username,
-          countryFlag: cloudPlayer.countryFlag,
-          rating: cloudPlayer.rating,
-          vipTier: cloudPlayer.vipTier,
-          addedAt: Date.now(),
-          isFavorite: true,
-          presenceStatus: 'online',
-        };
-      } else if (foundLocal) {
-        newFriend = {
-          uid: foundLocal.uid,
-          playerId: foundLocal.playerId,
-          username: foundLocal.username,
-          countryFlag: foundLocal.countryFlag,
-          rating: foundLocal.rating,
-          vipTier: foundLocal.vipTier,
-          addedAt: Date.now(),
-          isFavorite: true,
-          presenceStatus: 'online',
-        };
-      }
-
-      if (!newFriend) {
+      if (!cloudPlayer && !foundLocal && !targetPlayerId) {
         soundFX.playWrong();
         setSearchError(
-          `لم يتم العثور على لاعب حقيقي مسجل بالمعرّف أو الاسم (${q}). اطلب من صديقك نسخ الـ #ID الخاص به ومشاركته معك بدقة!`
+          `لم يتم العثور على لاعب مسجل بالمعرّف أو الاسم (${q}). اطلب من صديقك نسخ الـ #ID الخاص به ومشاركته معك بدقة!`
         );
         return;
       }
 
+      const targetName =
+        cloudPlayer?.username ||
+        foundLocal?.username ||
+        `لاعب ${targetPlayerId}`;
+      const targetFlag =
+        cloudPlayer?.countryFlag || foundLocal?.countryFlag || '🇸🇦';
+      const targetRating =
+        cloudPlayer?.rating || foundLocal?.rating || 1200;
+      const targetVip =
+        cloudPlayer?.vipTier || foundLocal?.vipTier || 'basic';
+      const targetUid =
+        cloudPlayer?.uid ||
+        foundLocal?.uid ||
+        `plr_${targetPlayerId.replace(/[^0-9]/g, '')}`;
+
+      // Create the friend_requests document in Cloud Firestore (`status: 'pending'`)
+      await sendCloudFriendRequest(account, {
+        uid: targetUid,
+        playerId: targetPlayerId,
+        username: targetName,
+        countryFlag: targetFlag,
+        rating: targetRating,
+        vipTier: targetVip,
+      });
+
       soundFX.playCorrect();
-      const updated: PlayerAccount = {
-        ...account,
-        friends: [newFriend, ...realFriends],
-      };
       setSearchQuery('');
-      setActiveFriend(newFriend);
-      onUpdateAccount(
-        updated,
-        `✅ تم العثور على اللاعب الحقيقي ${newFriend.username} (${newFriend.playerId}) وإضافته لقائمة أصدقائك المفضلين!`
-      );
+      const msg = `📨 تم إرسال طلب صداقة فوري عبر السحابة إلى ${targetName} (${targetPlayerId})! سيظهر له إشعار منبثق الآن وبمجرد ضغطه على (قبول) ستُضافان لبعضكما تلقائياً.`;
+      setSearchSuccessInfo(msg);
     } finally {
       setSearchingCloud(false);
     }
@@ -992,6 +1091,63 @@ export const FriendsAndChatView: React.FC<FriendsAndChatViewProps> = ({
         {searchError && (
           <div className="mt-3 rounded-xl bg-[#FF6B81]/15 border border-[#FF6B81] px-4 py-2.5 text-xs font-bold text-[#FF6B81]">
             {searchError}
+          </div>
+        )}
+
+        {searchSuccessInfo && (
+          <div className="mt-3 rounded-xl bg-[#38D9A9]/15 border border-[#38D9A9] px-4 py-2.5 text-xs font-extrabold text-[#38D9A9]">
+            {searchSuccessInfo}
+          </div>
+        )}
+
+        {/* Incoming Cloud Friend Requests List */}
+        {effectivePendingRequests.length > 0 && (
+          <div className="mt-4 pt-4 border-t border-[#28354E] space-y-2.5">
+            <div className="text-xs font-extrabold text-[#FFD166] flex items-center gap-1.5">
+              <BellRing className="w-4 h-4 animate-bounce" />
+              <span>
+                طلبات صداقة واردة بانتظار موافقتك ({effectivePendingRequests.length})
+              </span>
+            </div>
+            {effectivePendingRequests.map(req => (
+              <div
+                key={req.requestId}
+                className="p-3.5 rounded-2xl bg-[#070A12] border border-[#4FF5D2]/60 flex flex-wrap items-center justify-between gap-3"
+              >
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-xl bg-[#1B253B] border border-[#FFD166] flex items-center justify-center text-xl">
+                    {req.fromFlag}
+                  </div>
+                  <div>
+                    <div className="text-xs font-extrabold text-white">
+                      لديك طلب صداقة جديد من {req.fromName}{' '}
+                      <span className="font-mono-num text-[#4FF5D2]">
+                        ({req.fromPlayerId})
+                      </span>
+                    </div>
+                    <div className="text-[10px] text-slate-400">
+                      بمجرد الضغط على قبول سيتم إضافتكما لبعضكما في السحابة فوراً
+                    </div>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => handleAcceptRequestInternal(req)}
+                    className="min-h-[38px] px-4 rounded-xl bg-gradient-to-r from-[#4FF5D2] to-[#38D9A9] text-[#070A12] text-xs font-extrabold"
+                  >
+                    قبول ✅
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleRejectRequestInternal(req)}
+                    className="min-h-[38px] px-3.5 rounded-xl bg-[#1B253B] hover:bg-[#FF6B81]/20 text-xs font-bold text-slate-300 hover:text-[#FF6B81]"
+                  >
+                    رفض ✕
+                  </button>
+                </div>
+              </div>
+            ))}
           </div>
         )}
       </div>

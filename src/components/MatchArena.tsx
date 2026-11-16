@@ -11,13 +11,17 @@ import {
   SportsmanshipReview,
 } from '../types';
 import { BOT_OPPONENTS_POOL, QUIZ_CATEGORIES } from '../data/constants';
-import { getMatchQuestions } from '../data/questionBank';
+import {
+  getMatchQuestions,
+  getMatchQuestionsByIds,
+} from '../data/questionBank';
 import { soundFX } from '../utils/sound';
 import { getLocalizedCategory, getViewTranslations } from '../utils/i18n';
 import confetti from 'canvas-confetti';
 import { Flag, Volume2, VolumeX, Star } from 'lucide-react';
 import {
   createCloudPrivateRoom,
+  findOrCreateOnlineMatchmakingRoom,
   joinCloudPrivateRoom,
   subscribeToCloudRoom,
   updateCloudRoomState,
@@ -98,13 +102,29 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
   const [phase, setPhase] = useState<MatchPhase>(
     mode === 'online' || mode === 'room' ? 'MATCHMAKING' : 'PLAYING_ROUND'
   );
-  const [matchmakingSec, setMatchmakingSec] = useState(3);
-  const [roomCloudStatus, setRoomCloudStatus] = useState<'waiting' | 'active' | 'finished'>('waiting');
+  const [matchmakingSec, setMatchmakingSec] = useState(4);
+  const [activeRoomCode, setActiveRoomCode] = useState<string | undefined>(
+    roomCode
+  );
+  const activeRoomCodeRef = useRef<string | undefined>(roomCode);
+  activeRoomCodeRef.current = activeRoomCode;
+  const [roomCloudStatus, setRoomCloudStatus] = useState<
+    'waiting' | 'active' | 'finished'
+  >('waiting');
   const [waitingOpponentStep, setWaitingOpponentStep] = useState<boolean>(false);
+  const [opponentSelectedOption, setOpponentSelectedOption] =
+    useState<number>(-1);
+  const opponentSelectedOptionRef = useRef<number>(-1);
+  opponentSelectedOptionRef.current = opponentSelectedOption;
+  const [cloudRoundWinnerUid, setCloudRoundWinnerUid] = useState<string>('');
+  const cloudRoundWinnerUidRef = useRef<string>('');
+  cloudRoundWinnerUidRef.current = cloudRoundWinnerUid;
 
   // Deterministic seed if in 4-digit private room
-  const numericSeed = roomCode
-    ? roomCode.split('').reduce((acc, ch) => acc * 31 + ch.charCodeAt(0), 7)
+  const numericSeed = activeRoomCode
+    ? activeRoomCode
+        .split('')
+        .reduce((acc, ch) => acc * 31 + ch.charCodeAt(0), 7)
     : undefined;
 
   // 25 questions total (3 rounds * 8 questions = 24 + 1 Sudden Death question)
@@ -112,6 +132,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
     getMatchQuestions(category, 25, account.seenQuestionIds, numericSeed)
   );
   const appliedSeedsKeyRef = useRef<string>('');
+  const appliedQuestionIdsKeyRef = useRef<string>('');
 
   // Round & Question indices
   const [currentRound, setCurrentRound] = useState<number>(1); // 1..3
@@ -224,11 +245,17 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
   // Background 15-second Anti-Cheat monitor for Online mode
   const bgEnteredAtRef = useRef<number | null>(null);
 
-  // In mode === 'room', both players answer every question on their own device in real time
+  const isLiveCloudMatch = Boolean(
+    activeRoomCode && (mode === 'room' || !opponentIsBot)
+  );
+  const isLiveCloudMatchRef = useRef<boolean>(isLiveCloudMatch);
+  isLiveCloudMatchRef.current = isLiveCloudMatch;
+
+  // In live cloud match (room or matched online human), both players answer every question on their own device in real time
   const isPlayerTurn =
     phase === 'SUDDEN_DEATH'
       ? true
-      : mode === 'solo' || mode === 'room'
+      : mode === 'solo' || mode === 'room' || isLiveCloudMatch
       ? true
       : questionInRound % 2 === 1; // Q1, Q3, Q5, Q7 are Player 1; Q2, Q4, Q6, Q8 are Opponent/Player 2
 
@@ -248,17 +275,52 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
   const categoryMeta =
     QUIZ_CATEGORIES.find(c => c.id === category) || QUIZ_CATEGORIES[0];
 
-  // 1. Real Cloud Room Subscription (`onSnapshot` on `rooms/{roomCode}`)
+  // Keep activeRoomCode in sync if roomCode prop changes
   useEffect(() => {
-    if (mode !== 'room' || !roomCode) return;
+    if (roomCode && roomCode !== activeRoomCode) {
+      setActiveRoomCode(roomCode);
+      activeRoomCodeRef.current = roomCode;
+    }
+  }, [roomCode]);
+
+  // Real online matchmaking in Firestore for `mode === 'online'` (matches two real players into a shared cloud room if both are searching)
+  useEffect(() => {
+    if (mode !== 'online' || roomCode || phase !== 'MATCHMAKING') return;
+    let cancelled = false;
+    findOrCreateOnlineMatchmakingRoom(account, category)
+      .then(res => {
+        if (cancelled || !res || !res.roomCode) return;
+        if (phaseRef.current !== 'MATCHMAKING') return;
+        isRoomHostRef.current = res.role === 'host';
+        activeRoomCodeRef.current = res.roomCode;
+        setActiveRoomCode(res.roomCode);
+        if (res.role === 'guest' && res.hostName) {
+          setOpponentName(res.hostName);
+          setOpponentFlag(res.hostFlag || '🇸🇦');
+          setOpponentIsBot(false);
+          if (res.hostPlayerId) {
+            setOpponentPlayerId(res.hostPlayerId);
+          }
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [mode, roomCode, category]);
+
+  // 1. Real Cloud Room Subscription (`onSnapshot` on `rooms/{activeRoomCode}`)
+  useEffect(() => {
+    if (!activeRoomCode) return;
+    if (mode !== 'room' && mode !== 'online') return;
 
     let hasReceivedRoomDoc = false;
     let isJoiningGuestInFlight = false;
 
     const ensureRoomProvisioned = () => {
-      if (hasReceivedRoomDoc) return;
+      if (hasReceivedRoomDoc || mode !== 'room') return;
       createCloudPrivateRoom(
-        roomCode,
+        activeRoomCode,
         account,
         category,
         numericSeed || 7,
@@ -267,7 +329,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
     };
 
     const unsub = subscribeToCloudRoom(
-      roomCode,
+      activeRoomCode,
       data => {
         hasReceivedRoomDoc = true;
         const hostUid = String(data.hostUid || '');
@@ -289,6 +351,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         // Determine whether this device is the Host or the Guest
         const isHost =
           (hostPlayerId && hostPlayerId === account.playerId) ||
+          (hostUid && hostUid === account.uid && guestUid !== account.uid) ||
           (!guestPlayerId && hostName === account.username) ||
           (hostName === account.username && guestName !== account.username);
         isRoomHostRef.current = isHost;
@@ -301,7 +364,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           !isJoiningGuestInFlight
         ) {
           isJoiningGuestInFlight = true;
-          joinCloudPrivateRoom(roomCode, account)
+          joinCloudPrivateRoom(activeRoomCode, account)
             .catch(() => null)
             .finally(() => {
               isJoiningGuestInFlight = false;
@@ -321,13 +384,25 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           }
         }
 
-        // Synchronize unified questionSeeds array from Firestore so both devices get identical questions
-        if (Array.isArray(data.questionSeeds) && data.questionSeeds.length > 0) {
-          const seedsArr = data.questionSeeds.map((n: unknown) => Number(n) || 0);
+        // Synchronize unified questionIds & questionSeeds from Firestore so both phones get the exact same 25 questions
+        const qSeed = Number(data.questionSeed || numericSeed || 7);
+        const seedsArr = Array.isArray(data.questionSeeds)
+          ? data.questionSeeds.map((n: unknown) => Number(n) || 0)
+          : undefined;
+
+        if (Array.isArray(data.questionIds) && data.questionIds.length > 0) {
+          const qIds = data.questionIds.map((id: unknown) => String(id || '')).filter(Boolean);
+          const idsKey = `${qIds.join(',')}|${seedsArr ? seedsArr.join(',') : ''}`;
+          if (qIds.length > 0 && appliedQuestionIdsKeyRef.current !== idsKey) {
+            appliedQuestionIdsKeyRef.current = idsKey;
+            setQuestions(
+              getMatchQuestionsByIds(category, qIds, qSeed, seedsArr)
+            );
+          }
+        } else if (seedsArr && seedsArr.length > 0) {
           const key = seedsArr.join(',');
           if (appliedSeedsKeyRef.current !== key) {
             appliedSeedsKeyRef.current = key;
-            const qSeed = Number(data.questionSeed || numericSeed || 7);
             setQuestions(
               getMatchQuestions(
                 category,
@@ -340,20 +415,36 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           }
         }
 
-        // Synchronize live scores and answered round/question step from the opponent's device
+        // Synchronize live scores, selected option, roundWinnerUid, and currentRound (0-indexed question step) from Firestore
         const remoteScore = Number(
           isHost ? data.guestScore ?? 0 : data.hostScore ?? 0
         );
         const remoteAnswered = Number(
           isHost ? data.guestAnsweredRound ?? 0 : data.hostAnsweredRound ?? 0
         );
+        const remoteSelectedOpt = Number(
+          isHost
+            ? data.guestSelectedOption ?? -1
+            : data.hostSelectedOption ?? -1
+        );
+        const mySelectedOptInCloud = Number(
+          isHost
+            ? data.hostSelectedOption ?? -1
+            : data.guestSelectedOption ?? -1
+        );
         const remoteReadyBreak = Boolean(
           isHost ? data.guestReadyNextRound : data.hostReadyNextRound
         );
+        const cloudQuestionIdx = Number(data.currentRound ?? 0);
+        const rWinnerUid = String(data.roundWinnerUid || '');
 
         remoteAnsweredStepRef.current = remoteAnswered;
         totalOpponentPointsRef.current = remoteScore;
         setTotalOpponentPoints(remoteScore);
+        opponentSelectedOptionRef.current = remoteSelectedOpt;
+        setOpponentSelectedOption(remoteSelectedOpt);
+        cloudRoundWinnerUidRef.current = rWinnerUid;
+        setCloudRoundWinnerUid(rWinnerUid);
 
         const computedOppRoundPts = Math.max(
           0,
@@ -373,28 +464,56 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           (guestUid.length > 0 || guestName.length > 0)
         ) {
           soundFX.playCorrect();
+          setOpponentIsBot(false);
           answerLockRef.current = false;
           setIsAnswerLocked(false);
+          setOpponentSelectedOption(-1);
           setTimeLeft(6);
           questionStartMsRef.current = Date.now();
           setPhase('PLAYING_ROUND');
         }
 
-        // During PLAYING_ROUND or SUDDEN_DEATH: if both devices have now answered the current step, advance immediately!
         const activeStep =
           phaseRef.current === 'SUDDEN_DEATH'
             ? 25
             : (currentRoundRef.current - 1) * 8 + questionInRoundRef.current;
 
+        // 1) If Firestore `currentRound` (0-indexed question index) has advanced to `activeStep` (i.e. currentQuestionIndex + 1),
+        // advance both phones simultaneously to the exact same question!
         if (
           (phaseRef.current === 'PLAYING_ROUND' ||
             phaseRef.current === 'SUDDEN_DEATH') &&
-          myAnsweredStepRef.current >= activeStep &&
-          remoteAnswered >= activeStep &&
+          cloudQuestionIdx >= activeStep &&
           stepAdvancedRef.current < activeStep
         ) {
           stepAdvancedRef.current = activeStep;
           setWaitingOpponentStep(false);
+          window.setTimeout(() => {
+            proceedToNextRoomStep(activeStep);
+          }, 350);
+        }
+
+        // 2) Or if both players have now answered the current question (`myAnsweredStep >= activeStep && remoteAnswered >= activeStep`
+        // or both selected options are !== -1), update `currentRound: activeStep` in Firestore and advance both phones together!
+        const bothSelectedInCloud =
+          mySelectedOptInCloud !== -1 && remoteSelectedOpt !== -1;
+        if (
+          (phaseRef.current === 'PLAYING_ROUND' ||
+            phaseRef.current === 'SUDDEN_DEATH') &&
+          ((myAnsweredStepRef.current >= activeStep &&
+            remoteAnswered >= activeStep) ||
+            bothSelectedInCloud) &&
+          stepAdvancedRef.current < activeStep
+        ) {
+          stepAdvancedRef.current = activeStep;
+          setWaitingOpponentStep(false);
+          if (isHost && cloudQuestionIdx < activeStep) {
+            updateCloudRoomState(activeRoomCode, {
+              currentRound: activeStep,
+              hostSelectedOption: -1,
+              guestSelectedOption: -1,
+            }).catch(() => {});
+          }
           window.setTimeout(() => {
             proceedToNextRoomStep(activeStep);
           }, 650);
@@ -421,7 +540,11 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
     );
 
     const retryInterval = window.setInterval(() => {
-      if (phaseRef.current === 'MATCHMAKING' && !hasReceivedRoomDoc) {
+      if (
+        mode === 'room' &&
+        phaseRef.current === 'MATCHMAKING' &&
+        !hasReceivedRoomDoc
+      ) {
         ensureRoomProvisioned();
       }
     }, 3000);
@@ -432,8 +555,9 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
     };
   }, [
     mode,
-    roomCode,
+    activeRoomCode,
     account.playerId,
+    account.uid,
     account.username,
     category,
     customOpponentPlayerId,
@@ -450,7 +574,18 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
       setMatchmakingSec(prev => {
         if (prev <= 1) {
           clearInterval(timer);
-          if (!customOpponentName) {
+          // If a real human player already joined the online matchmaking room, `phase` is already 'PLAYING_ROUND'
+          if (phaseRef.current !== 'MATCHMAKING') return 0;
+          if (!customOpponentName && opponentIsBot) {
+            // Close the unclaimed waiting room in Firestore and fall back to bot in solo/online queue
+            if (activeRoomCodeRef.current) {
+              const unclaimedCode = activeRoomCodeRef.current;
+              activeRoomCodeRef.current = undefined;
+              setActiveRoomCode(undefined);
+              updateCloudRoomState(unclaimedCode, { status: 'finished' }).catch(
+                () => {}
+              );
+            }
             const bot =
               BOT_OPPONENTS_POOL[
                 Math.floor(Math.random() * BOT_OPPONENTS_POOL.length)
@@ -468,9 +603,9 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         }
         return prev - 1;
       });
-    }, 900);
+    }, 950);
     return () => clearInterval(timer);
-  }, [phase, mode, customOpponentName]);
+  }, [phase, mode, customOpponentName, opponentIsBot]);
 
   // 2. Background Visibility Monitor (15s rule in Online mode)
   useEffect(() => {
@@ -599,9 +734,9 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
   useEffect(() => {
     if (phase !== 'ROUND_BREAK') return;
 
-    // Only auto-ready in Bot/Local mode; in `mode === 'room'`, readiness comes from Firestore `onSnapshot`
+    // Only auto-ready in Bot/Local mode; in live cloud match (`isLiveCloudMatch`), readiness comes from Firestore `onSnapshot`
     let oppReadyTimer: ReturnType<typeof setTimeout> | null = null;
-    if (mode !== 'room') {
+    if (!isLiveCloudMatch) {
       oppReadyTimer = setTimeout(() => {
         setOpponentReadyBreak(true);
       }, 1800);
@@ -632,18 +767,26 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
       if (oppReadyTimer) clearTimeout(oppReadyTimer);
       clearInterval(breakInterval);
     };
-  }, [phase, mode, playerReadyBreak]);
+  }, [phase, isLiveCloudMatch, playerReadyBreak]);
 
   // Advance from Round Break as soon as both players click Ready
   useEffect(() => {
     if (phase === 'ROUND_BREAK' && playerReadyBreak && opponentReadyBreak) {
       const nextR = currentRound + 1;
-      if (mode === 'room' && roomCode) {
+      if (isLiveCloudMatch && activeRoomCode) {
         updateCloudRoomState(
-          roomCode,
+          activeRoomCode,
           isRoomHostRef.current
-            ? { hostReadyNextRound: false }
-            : { guestReadyNextRound: false }
+            ? {
+                hostReadyNextRound: false,
+                hostSelectedOption: -1,
+                guestSelectedOption: -1,
+              }
+            : {
+                guestReadyNextRound: false,
+                hostSelectedOption: -1,
+                guestSelectedOption: -1,
+              }
         ).catch(() => {});
       }
       setTimeout(() => {
@@ -656,6 +799,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         opponentRoundPointsRef.current = 0;
         setHiddenOptions([]);
         setSelectedOption(null);
+        setOpponentSelectedOption(-1);
         setIsAnswerLocked(false);
         setWaitingOpponentStep(false);
         answerLockRef.current = false;
@@ -664,47 +808,91 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         setPhase('PLAYING_ROUND');
       }, 500);
     }
-  }, [phase, mode, roomCode, playerReadyBreak, opponentReadyBreak, currentRound]);
+  }, [
+    phase,
+    isLiveCloudMatch,
+    activeRoomCode,
+    playerReadyBreak,
+    opponentReadyBreak,
+    currentRound,
+  ]);
 
   /**
-   * Synchronizes the player's score and answered step to Firestore in `mode === 'room'`,
-   * then waits until both players have answered (or round question timer + grace completes)
-   * before advancing to the next question.
+   * Synchronizes the player's score, selected option, roundWinnerUid, and answered step to Firestore
+   * in `isLiveCloudMatch` (room mode or online mode with a real human opponent),
+   * and advances both phones together to `currentRound + 1` as soon as both players answer or the timer expires.
    */
-  const syncAndCoordinateRoomStep = (newTotalPlayerScore: number, stepNum: number) => {
+  const syncAndCoordinateRoomStep = (
+    newTotalPlayerScore: number,
+    stepNum: number,
+    chosenOptionIdx: number,
+    wasCorrect: boolean
+  ) => {
     myAnsweredStepRef.current = stepNum;
-    if (roomCode) {
+    const roomIdToUpdate = activeRoomCodeRef.current;
+    const opponentAlreadyAnsweredThisStep =
+      remoteAnsweredStepRef.current >= stepNum ||
+      opponentSelectedOptionRef.current !== -1;
+
+    if (roomIdToUpdate) {
+      const winnerPatch =
+        wasCorrect && !cloudRoundWinnerUidRef.current
+          ? { roundWinnerUid: account.uid || account.playerId }
+          : {};
+      const nextRoundPatch = opponentAlreadyAnsweredThisStep
+        ? {
+            currentRound: stepNum,
+            hostSelectedOption: -1,
+            guestSelectedOption: -1,
+          }
+        : {};
       const payload = isRoomHostRef.current
         ? {
             hostScore: Math.min(500, newTotalPlayerScore),
             hostAnsweredRound: stepNum,
+            hostSelectedOption: chosenOptionIdx,
+            ...winnerPatch,
+            ...nextRoundPatch,
           }
         : {
             guestScore: Math.min(500, newTotalPlayerScore),
             guestAnsweredRound: stepNum,
+            guestSelectedOption: chosenOptionIdx,
+            ...winnerPatch,
+            ...nextRoundPatch,
           };
-      updateCloudRoomState(roomCode, payload).catch(() => {});
+      updateCloudRoomState(roomIdToUpdate, payload).catch(() => {});
     }
 
-    // If opponent already answered this step in Firestore, advance after brief visual feedback
-    if (remoteAnsweredStepRef.current >= stepNum) {
+    // If opponent already answered this step in Firestore, advance both devices together after brief visual reveal
+    if (opponentAlreadyAnsweredThisStep) {
       if (stepAdvancedRef.current < stepNum) {
         stepAdvancedRef.current = stepNum;
         setWaitingOpponentStep(false);
         window.setTimeout(() => {
           proceedToNextRoomStep(stepNum);
-        }, 850);
+        }, 700);
       }
       return;
     }
 
-    // Otherwise, show waiting indicator until opponent answers OR the round question timer expires
+    // Otherwise, show live waiting indicator until opponent answers OR the question timer expires
     setWaitingOpponentStep(true);
-    const maxWaitMs = Math.max(1500, timeLeft * 1000 + 2200);
+    const maxWaitMs = Math.max(1400, timeLeft * 1000 + 1800);
     window.setTimeout(() => {
-      if (stepAdvancedRef.current < stepNum && phaseRef.current !== 'MATCH_OVER') {
+      if (
+        stepAdvancedRef.current < stepNum &&
+        phaseRef.current !== 'MATCH_OVER'
+      ) {
         stepAdvancedRef.current = stepNum;
         setWaitingOpponentStep(false);
+        if (roomIdToUpdate) {
+          updateCloudRoomState(roomIdToUpdate, {
+            currentRound: stepNum,
+            hostSelectedOption: -1,
+            guestSelectedOption: -1,
+          }).catch(() => {});
+        }
         proceedToNextRoomStep(stepNum);
       }
     }, maxWaitMs);
@@ -717,11 +905,20 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
       const myTotal = totalPlayerPointsRef.current;
       const oppTotal = totalOpponentPointsRef.current;
       if (myTotal > oppTotal) {
-        triggerMatchEnd('win', 'حسمت المباراة في السؤال الفاصل الحاسم عبر الغرفة السحابية ⚡!');
+        triggerMatchEnd(
+          'win',
+          'حسمت المباراة في السؤال الفاصل الحاسم عبر الغرفة السحابية ⚡!'
+        );
       } else if (oppTotal > myTotal) {
-        triggerMatchEnd('loss', 'حسم الخصم السؤال الفاصل الحاسم في الغرفة السحابية.');
+        triggerMatchEnd(
+          'loss',
+          'حسم الخصم السؤال الفاصل الحاسم في الغرفة السحابية.'
+        );
       } else {
-        triggerMatchEnd('win', 'تعادل مثير في السؤال الفاصل وتم حسم المواجهة لصالحك بأفضلية الأداء!');
+        triggerMatchEnd(
+          'win',
+          'تعادل مثير في السؤال الفاصل وتم حسم المواجهة لصالحك بأفضلية الأداء!'
+        );
       }
       return;
     }
@@ -733,6 +930,8 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
       setQuestionInRound(qInR + 1);
       setHiddenOptions([]);
       setSelectedOption(null);
+      setOpponentSelectedOption(-1);
+      setCloudRoundWinnerUid('');
       setIsAnswerLocked(false);
       setWaitingOpponentStep(false);
       answerLockRef.current = false;
@@ -796,8 +995,13 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
     if (isPlayerTurn) {
       setComboCount(0);
     }
-    if (mode === 'room') {
-      syncAndCoordinateRoomStep(totalPlayerPointsRef.current, currentStepNumber);
+    if (isLiveCloudMatchRef.current) {
+      syncAndCoordinateRoomStep(
+        totalPlayerPointsRef.current,
+        currentStepNumber,
+        -2,
+        false
+      );
       return;
     }
     setTimeout(() => advanceToNextStep(false), 1100);
@@ -805,7 +1009,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
 
   const submitTurnAnswer = (optionIdx: number, isBotAction: boolean = false) => {
     if (isAnswerLocked || answerLockRef.current) return;
-    if (isBotAction && mode === 'room') return; // Double guard: never accept bot actions in rooms
+    if (isBotAction && (mode === 'room' || isLiveCloudMatchRef.current)) return; // Double guard: never accept bot actions in rooms or live human matches
     answerLockRef.current = true;
 
     // Anti-Cheat check for human touches (< 120ms impossible reaction speed)
@@ -844,13 +1048,13 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         );
       }
 
-      if (mode === 'room') {
+      if (isLiveCloudMatchRef.current) {
         const nextTotal = isCorrect
           ? totalPlayerPointsRef.current + 3
           : totalPlayerPointsRef.current;
         totalPlayerPointsRef.current = nextTotal;
         setTotalPlayerPoints(nextTotal);
-        syncAndCoordinateRoomStep(nextTotal, 25);
+        syncAndCoordinateRoomStep(nextTotal, 25, optionIdx, isCorrect);
         return;
       }
 
@@ -935,8 +1139,13 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
       }
     }
 
-    if (mode === 'room') {
-      syncAndCoordinateRoomStep(nextTotalPlayer, currentStepNumber);
+    if (isLiveCloudMatchRef.current) {
+      syncAndCoordinateRoomStep(
+        nextTotalPlayer,
+        currentStepNumber,
+        optionIdx,
+        isCorrect
+      );
       return;
     }
 
@@ -1009,8 +1218,8 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
     setForfeitReasonAr(reasonAr);
     setPhase('MATCH_OVER');
 
-    if (mode === 'room' && roomCode) {
-      updateCloudRoomState(roomCode, {
+    if (isLiveCloudMatchRef.current && activeRoomCodeRef.current) {
+      updateCloudRoomState(activeRoomCodeRef.current, {
         status: 'finished',
       }).catch(() => {});
     }
@@ -1443,9 +1652,9 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
             onClick={() => {
               soundFX.playClick();
               setPlayerReadyBreak(true);
-              if (mode === 'room' && roomCode) {
+              if (isLiveCloudMatch && activeRoomCode) {
                 updateCloudRoomState(
-                  roomCode,
+                  activeRoomCode,
                   isRoomHostRef.current
                     ? { hostReadyNextRound: true }
                     : { guestReadyNextRound: true }
@@ -1679,6 +1888,10 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
 
   // RENDER 4: Active Playing Round or Sudden Death
   const isUrgentRed = timeLeft <= 2;
+  const hasOpponentAnsweredCurrentStep =
+    isLiveCloudMatch &&
+    (opponentSelectedOption !== -1 ||
+      remoteAnsweredStepRef.current >= currentStepNumber);
 
   return (
     <div className="max-w-3xl mx-auto px-3 sm:px-6 py-4 select-none">
@@ -1695,8 +1908,8 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           <div className="flex items-center gap-2">
             <span>{categoryMeta.icon}</span>
             <span className="font-bold text-white">{locCategory.name}</span>
-            {roomCode && (
-              <span className="font-mono-num text-[#4FF5D2]">· #{roomCode}</span>
+            {activeRoomCode && (
+              <span className="font-mono-num text-[#4FF5D2]">· #{activeRoomCode}</span>
             )}
             {activeSfxBadge && (
               <span
@@ -1762,7 +1975,9 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
               </span>
             </div>
             <div className="text-xs font-bold text-white truncate">{account.username}</div>
-            <div className="text-[10px] font-mono-num text-slate-400">{account.playerId}</div>
+            <div className="text-[10px] font-mono-num text-slate-400">
+              {account.playerId} · مجموع: {totalPlayerPoints}
+            </div>
           </div>
 
           {/* Center 6-Second Timer & Combo */}
@@ -1788,7 +2003,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           {/* Opponent Card */}
           <div
             className={`relative p-3 rounded-2xl border transition-all ${
-              !isPlayerTurn || mode === 'room'
+              !isPlayerTurn || isLiveCloudMatch
                 ? 'bg-[#1B253B] border-[#A78BFA] shadow-[0_0_18px_rgba(167,139,250,0.25)]'
                 : 'bg-[#070A12]/60 border-[#28354E] opacity-75'
             }`}
@@ -1806,8 +2021,25 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
             </div>
             <div className="text-xs font-bold text-white truncate">{opponentName}</div>
             <div className="text-[10px] font-mono-num text-slate-400">
-              {opponentIsBot ? 'AI Bot' : opponentPlayerId}
+              {opponentIsBot ? 'AI Bot' : `${opponentPlayerId || ''} · مجموع: ${totalOpponentPoints}`}
             </div>
+            {isLiveCloudMatch && (
+              <div className="mt-1">
+                {opponentSelectedOption >= 0 || hasOpponentAnsweredCurrentStep ? (
+                  <span className="inline-block px-2 py-0.5 rounded-md bg-[#38D9A9]/20 border border-[#38D9A9] text-[10px] font-extrabold text-[#38D9A9] animate-pulse">
+                    ⚡ أجاب الخصم الآن!
+                  </span>
+                ) : opponentSelectedOption === -2 ? (
+                  <span className="inline-block px-2 py-0.5 rounded-md bg-[#FF6B81]/20 border border-[#FF6B81] text-[10px] font-extrabold text-[#FF6B81]">
+                    ⏱️ انتهى وقت الخصم
+                  </span>
+                ) : (
+                  <span className="inline-block px-2 py-0.5 rounded-md bg-[#070A12] border border-[#28354E] text-[10px] font-bold text-slate-400">
+                    🤔 يفكر في الإجابة...
+                  </span>
+                )}
+              </div>
+            )}
           </div>
         </div>
 
@@ -1827,9 +2059,13 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         <div className="text-xs font-bold">
           {phase === 'SUDDEN_DEATH' ? (
             <span className="text-[#FFD166]">⚡ Sudden Death!</span>
-          ) : mode === 'room' && waitingOpponentStep ? (
+          ) : isLiveCloudMatch && waitingOpponentStep ? (
             <span className="text-[#FFD166] animate-pulse">
-              ⏳ تم تسجيل إجابتك — بانتظار إجابة {opponentName} للانتقال للسؤال التالي...
+              ⏳ تم تسجيل إجابتك — بانتظار إجابة {opponentName} للانتقال معاً للسؤال التالي...
+            </span>
+          ) : isLiveCloudMatch && hasOpponentAnsweredCurrentStep && !isAnswerLocked ? (
+            <span className="text-[#38D9A9] animate-pulse">
+              ⚡ أجاب {opponentName} على هذا السؤال! أجب الآن قبل انتهاء المؤقت!
             </span>
           ) : isPlayerTurn ? (
             <span className="text-[#4FF5D2]">{vt.yourTurnBanner}</span>
@@ -1891,6 +2127,11 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
 
             const canPlayerClick =
               !isAnswerLocked && (isPlayerTurn || mode === 'local');
+            const isOpponentPickedThis =
+              isLiveCloudMatch &&
+              isAnswerLocked &&
+              opponentSelectedOption >= 0 &&
+              opponentSelectedOption === idx;
 
             return (
               <button
@@ -1898,10 +2139,15 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
                 type="button"
                 disabled={!canPlayerClick}
                 onClick={() => submitTurnAnswer(idx, false)}
-                className={`min-h-[56px] px-4 py-3 rounded-2xl border font-bold text-sm text-start flex items-center justify-between transition-all ${btnStyle}`}
+                className={`min-h-[56px] px-4 py-3 rounded-2xl border font-bold text-sm text-start flex items-center justify-between gap-2 transition-all ${btnStyle}`}
               >
-                <span className="leading-snug">{optText}</span>
-                <span className="w-7 h-7 rounded-lg bg-[#070A12]/60 flex items-center justify-center text-xs font-mono-num shrink-0 mr-2">
+                <span className="leading-snug flex-1">{optText}</span>
+                {isOpponentPickedThis && (
+                  <span className="px-2 py-0.5 rounded-lg bg-[#A78BFA]/25 border border-[#A78BFA] text-[10px] font-extrabold text-[#A78BFA] shrink-0">
+                    {opponentFlag} اختيار الخصم
+                  </span>
+                )}
+                <span className="w-7 h-7 rounded-lg bg-[#070A12]/60 flex items-center justify-center text-xs font-mono-num shrink-0 mr-1">
                   {idx + 1}
                 </span>
               </button>

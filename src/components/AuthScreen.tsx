@@ -100,7 +100,20 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onSuccess }) => {
     }
 
     // Immediately normalize and persist account to localStorage before anything else
-    const sanitizedAcc = sanitizePlayerAccount(res.account);
+    const sanitizedAcc = sanitizePlayerAccount({
+      ...res.account,
+      friends: Array.isArray(res.account.friends) ? res.account.friends : [],
+      xp: Number(res.account.xp) || 0,
+      coins:
+        res.account.coins !== undefined &&
+        !Number.isNaN(Number(res.account.coins)) &&
+        Number(res.account.coins) > 0
+          ? Number(res.account.coins)
+          : 500,
+      language: res.account.language || 'ar',
+      equippedTheme: res.account.equippedTheme || 'midnight_cyan',
+      equippedBorder: res.account.equippedBorder || 'default_cyan',
+    });
     setActiveAccountUid(sanitizedAcc.uid);
     const persisted = persistUpdatedAccount(sanitizedAcc);
 
@@ -113,11 +126,24 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onSuccess }) => {
 
     // If online: show "جاري التحميل..." while syncing with Firestore (12s max safety timeout)
     setIsSubmitting(true);
-    await syncAuthAccountWithCloud(persisted.account, 12000).catch(() => null);
+    const cloudPatch = await syncAuthAccountWithCloud(
+      persisted.account,
+      12000
+    ).catch(() => null);
     setIsSubmitting(false);
 
+    const finalAcc = cloudPatch
+      ? persistUpdatedAccount(
+          sanitizePlayerAccount({
+            ...persisted.account,
+            ...cloudPatch,
+          })
+        ).account
+      : persisted.account;
+
+    setActiveAccountUid(finalAcc.uid);
     soundFX.playVictory();
-    onSuccess(persisted.account);
+    onSuccess(finalAcc);
   };
 
   const handleLogin = async (e: React.FormEvent) => {
@@ -134,7 +160,19 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onSuccess }) => {
     }
 
     // Immediately normalize and persist account to localStorage before anything else
-    const sanitizedAcc = sanitizePlayerAccount(res.account);
+    const sanitizedAcc = sanitizePlayerAccount({
+      ...res.account,
+      friends: Array.isArray(res.account.friends) ? res.account.friends : [],
+      xp: Number(res.account.xp) || 0,
+      coins:
+        res.account.coins !== undefined &&
+        !Number.isNaN(Number(res.account.coins))
+          ? Number(res.account.coins)
+          : 500,
+      language: res.account.language || 'ar',
+      equippedTheme: res.account.equippedTheme || 'midnight_cyan',
+      equippedBorder: res.account.equippedBorder || 'default_cyan',
+    });
     setActiveAccountUid(sanitizedAcc.uid);
     const persisted = persistUpdatedAccount(sanitizedAcc);
 
@@ -147,11 +185,24 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onSuccess }) => {
 
     // If online: show "جاري التحميل..." while syncing with Firestore (12s max safety timeout)
     setIsSubmitting(true);
-    await syncAuthAccountWithCloud(persisted.account, 12000).catch(() => null);
+    const cloudPatch = await syncAuthAccountWithCloud(
+      persisted.account,
+      12000
+    ).catch(() => null);
     setIsSubmitting(false);
 
+    const finalAcc = cloudPatch
+      ? persistUpdatedAccount(
+          sanitizePlayerAccount({
+            ...persisted.account,
+            ...cloudPatch,
+          })
+        ).account
+      : persisted.account;
+
+    setActiveAccountUid(finalAcc.uid);
     soundFX.playCorrect();
-    onSuccess(persisted.account);
+    onSuccess(finalAcc);
   };
 
   return (

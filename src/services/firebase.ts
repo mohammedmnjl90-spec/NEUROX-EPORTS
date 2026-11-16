@@ -31,11 +31,15 @@ import {
   computeLevelInfo,
   REALISTIC_HUMAN_LEADERBOARD_SEED,
 } from '../data/constants';
+import { getMatchQuestions } from '../data/questionBank';
 import {
+  CategoryId,
+  CloudFriendRequestItem,
   CloudManagedPlayer,
   FriendItem,
   FriendPresenceStatus,
   PlayerAccount,
+  VipTier,
 } from '../types';
 
 // Use the provisioned firebase-applet-config.json directly
@@ -705,7 +709,10 @@ export async function createCloudPrivateRoom(
 
   const hostUid = getSafeDocUid(hostAccount);
   const path = `rooms/${cleanRoomCode}`;
-  const cleanTargetId = normalizePlayerIdTag(targetPlayerId || '').slice(0, 32);
+  const cleanTargetId =
+    targetPlayerId === '__online_matchmaking__'
+      ? '__online_matchmaking__'
+      : normalizePlayerIdTag(targetPlayerId || '').slice(0, 32);
   const safeSeed = Math.max(0, Math.floor(Number(questionSeed) || 7));
   const unifiedSeeds = (
     customQuestionSeeds && customQuestionSeeds.length > 0
@@ -723,8 +730,19 @@ export async function createCloudPrivateRoom(
   const safeHostPlayerId = (hostAccount.playerId || '#1000000000')
     .trim()
     .slice(0, 16);
-  const safeCategory =
-    (category || 'cocktail').trim().slice(0, 32) || 'cocktail';
+  const safeCategory = (
+    (category || 'cocktail').trim().slice(0, 32) || 'cocktail'
+  ) as CategoryId;
+
+  const unifiedQuestionIds = getMatchQuestions(
+    safeCategory,
+    25,
+    [],
+    safeSeed,
+    unifiedSeeds
+  )
+    .slice(0, 25)
+    .map(q => String(q.id || 'q_qur_1'));
 
   // Sync player profile in background without blocking room creation
   syncPlayerToCloud(hostAccount).catch(() => {});
@@ -743,9 +761,14 @@ export async function createCloudPrivateRoom(
     category: safeCategory,
     questionSeed: safeSeed,
     questionSeeds: unifiedSeeds,
+    questionIds: unifiedQuestionIds,
+    currentRound: 0,
     status: 'waiting',
     hostScore: 0,
     guestScore: 0,
+    hostSelectedOption: -1,
+    guestSelectedOption: -1,
+    roundWinnerUid: '',
     hostAnsweredRound: 0,
     guestAnsweredRound: 0,
     hostReadyNextRound: false,
@@ -789,6 +812,8 @@ export async function joinCloudPrivateRoom(
   category: string;
   questionSeed: number;
   questionSeeds: number[];
+  questionIds: string[];
+  currentRound: number;
   hostName: string;
   hostFlag: string;
   hostUid: string;
@@ -801,10 +826,20 @@ export async function joinCloudPrivateRoom(
   const fallbackSeed = cleanRoomCode
     .split('')
     .reduce((acc, ch) => acc * 31 + ch.charCodeAt(0), 7);
+  const fallbackSeeds = generateRoomQuestionSeeds(fallbackSeed, 25);
+  const fallbackQuestionIds = getMatchQuestions(
+    'cocktail',
+    25,
+    [],
+    fallbackSeed,
+    fallbackSeeds
+  ).map(q => q.id);
   const fallbackResult = {
     category: 'cocktail',
     questionSeed: fallbackSeed,
-    questionSeeds: generateRoomQuestionSeeds(fallbackSeed, 25),
+    questionSeeds: fallbackSeeds,
+    questionIds: fallbackQuestionIds,
+    currentRound: 0,
     hostName: '',
     hostFlag: '🇸🇦',
     hostUid: '',
@@ -863,12 +898,22 @@ export async function joinCloudPrivateRoom(
       );
     }
 
+    const catStr = String(data.category || 'cocktail') as CategoryId;
+    const qSeed = Number(data.questionSeed || fallbackSeed);
+    const qSeeds = Array.isArray(data.questionSeeds)
+      ? data.questionSeeds.map((n: unknown) => Number(n) || 0)
+      : generateRoomQuestionSeeds(qSeed, 25);
+    const qIds =
+      Array.isArray(data.questionIds) && data.questionIds.length > 0
+        ? data.questionIds.map((id: unknown) => String(id || 'q_qur_1'))
+        : getMatchQuestions(catStr, 25, [], qSeed, qSeeds).map(q => q.id);
+
     return {
-      category: String(data.category || 'cocktail'),
-      questionSeed: Number(data.questionSeed || fallbackSeed),
-      questionSeeds: Array.isArray(data.questionSeeds)
-        ? data.questionSeeds.map((n: unknown) => Number(n) || 0)
-        : generateRoomQuestionSeeds(Number(data.questionSeed || fallbackSeed), 25),
+      category: catStr,
+      questionSeed: qSeed,
+      questionSeeds: qSeeds,
+      questionIds: qIds,
+      currentRound: Number(data.currentRound ?? 0),
       hostName: String(data.hostName || 'المضيف'),
       hostFlag: String(data.hostFlag || '🇸🇦'),
       hostUid: String(data.hostUid || ''),
@@ -884,8 +929,13 @@ export async function joinCloudPrivateRoom(
 export async function updateCloudRoomState(
   roomCode: string,
   updates: Partial<{
+    currentRound: number;
+    questionIds: string[];
     hostScore: number;
     guestScore: number;
+    hostSelectedOption: number;
+    guestSelectedOption: number;
+    roundWinnerUid: string;
     hostAnsweredRound: number;
     guestAnsweredRound: number;
     hostReadyNextRound: boolean;
@@ -910,6 +960,88 @@ export async function updateCloudRoomState(
   }
 }
 
+/**
+ * Attempts to match two real online players in `mode === 'online'` via Firestore `rooms`
+ * before falling back to AI Bot if no human opponent is currently searching.
+ */
+export async function findOrCreateOnlineMatchmakingRoom(
+  playerAccount: PlayerAccount,
+  category: CategoryId
+): Promise<{
+  role: 'host' | 'guest';
+  roomCode: string;
+  hostName?: string;
+  hostFlag?: string;
+  hostPlayerId?: string;
+} | null> {
+  if (typeof navigator !== 'undefined' && !navigator.onLine) return null;
+  const mySafeUid = getSafeDocUid(playerAccount);
+  const myPid = normalizePlayerIdTag(playerAccount.playerId);
+
+  try {
+    const q = query(
+      collection(db, 'rooms'),
+      where('status', '==', 'waiting'),
+      limit(20)
+    );
+    const snap = await getDocs(q);
+    const now = Date.now();
+
+    for (const d of snap.docs) {
+      const data = d.data();
+      const targetId = String(data.targetPlayerId || '');
+      const rCat = String(data.category || 'cocktail');
+      const hUid = String(data.hostUid || '');
+      const hPid = normalizePlayerIdTag(String(data.hostPlayerId || ''));
+      const rawCreated = data.createdAt || data.updatedAt;
+      const createdMs =
+        rawCreated && typeof rawCreated.toMillis === 'function'
+          ? rawCreated.toMillis()
+          : now;
+
+      if (
+        targetId === '__online_matchmaking__' &&
+        rCat === category &&
+        hUid !== mySafeUid &&
+        hPid !== myPid &&
+        now - createdMs <= 15000
+      ) {
+        const joined = await joinCloudPrivateRoom(d.id, playerAccount);
+        if (joined && joined.status === 'active') {
+          return {
+            role: 'guest',
+            roomCode: d.id,
+            hostName: joined.hostName,
+            hostFlag: joined.hostFlag,
+            hostPlayerId: joined.hostPlayerId,
+          };
+        }
+      }
+    }
+
+    const mmCode = `mm_${Math.floor(1000 + Math.random() * 9000)}`;
+    const seed = mmCode
+      .split('')
+      .reduce((acc, ch) => acc * 31 + ch.charCodeAt(0), 7);
+    const created = await createCloudPrivateRoom(
+      mmCode,
+      playerAccount,
+      category,
+      seed,
+      '__online_matchmaking__'
+    );
+    if (created) {
+      return {
+        role: 'host',
+        roomCode: mmCode,
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 export function subscribeToCloudRoom(
   roomCode: string,
   onUpdate: (data: Record<string, unknown>) => void,
@@ -921,19 +1053,24 @@ export function subscribeToCloudRoom(
     .slice(0, 16);
   if (!cleanRoomCode) return null;
   const path = `rooms/${cleanRoomCode}`;
-  return onSnapshot(
-    doc(db, 'rooms', cleanRoomCode),
-    snap => {
-      if (snap.exists()) {
-        onUpdate(snap.data());
-      } else {
-        onMissing?.();
+  try {
+    return onSnapshot(
+      doc(db, 'rooms', cleanRoomCode),
+      snap => {
+        if (snap.exists()) {
+          onUpdate(snap.data());
+        } else {
+          onMissing?.();
+        }
+      },
+      error => {
+        handleFirestoreError(error, OperationType.GET, path);
       }
-    },
-    error => {
-      handleFirestoreError(error, OperationType.GET, path);
-    }
-  );
+    );
+  } catch (err) {
+    handleFirestoreError(err, OperationType.GET, path);
+    return null;
+  }
 }
 
 /**
@@ -957,108 +1094,364 @@ export function subscribeToIncomingCloudChallenges(
   if (typeof navigator !== 'undefined' && !navigator.onLine) {
     return () => {};
   }
-  const mySafeUid = getSafeDocUid(myAccount);
-  const myNormalizedId = normalizePlayerIdTag(myAccount.playerId);
-  const path = 'rooms';
-  const seenRoomCodes = new Set<string>();
-  let isInitialSnapshot = true;
+  try {
+    const mySafeUid = getSafeDocUid(myAccount);
+    const myNormalizedId = normalizePlayerIdTag(myAccount.playerId || '');
+    const path = 'rooms';
+    const seenRoomCodes = new Set<string>();
+    let isInitialSnapshot = true;
 
-  const q = query(collection(db, 'rooms'), where('status', '==', 'waiting'));
+    const q = query(collection(db, 'rooms'), where('status', '==', 'waiting'));
 
-  const processRoomDoc = (
-    docId: string,
-    data: Record<string, any>,
-    isFromInitial: boolean
-  ) => {
-    const roomCode = String(data.roomCode || docId);
-    const hostUid = String(data.hostUid || '');
-    const hostName = String(data.hostName || 'منافس جديد');
-    const hostFlag = String(data.hostFlag || '🇸🇦');
-    const hostPlayerId = String(data.hostPlayerId || '');
-    const targetPlayerId = normalizePlayerIdTag(String(data.targetPlayerId || ''));
-    const category = String(data.category || 'cocktail');
-
-    // Never notify the host about their own room
-    if (
-      hostUid === mySafeUid ||
-      (hostPlayerId && normalizePlayerIdTag(hostPlayerId) === myNormalizedId) ||
-      hostName.toLowerCase() === myAccount.username.toLowerCase()
-    ) {
-      seenRoomCodes.add(roomCode);
-      return;
-    }
-
-    // If this room targets a specific player ID, ONLY notify that exact target player
-    if (targetPlayerId && targetPlayerId !== myNormalizedId) {
-      seenRoomCodes.add(roomCode);
-      return;
-    }
-
-    // On initial snapshot, only trigger if this room is specifically targeting this player
-    // and was created within the last 5 minutes so stale old rooms don't pop up
-    if (isFromInitial) {
-      const rawCreated = data.createdAt || data.updatedAt;
-      const createdMs =
-        rawCreated && typeof rawCreated.toMillis === 'function'
-          ? rawCreated.toMillis()
-          : Date.now();
-      const isRecentTargetedInvite =
-        targetPlayerId === myNormalizedId &&
-        Date.now() - createdMs <= 5 * 60 * 1000;
-
-      seenRoomCodes.add(roomCode);
-      if (isRecentTargetedInvite) {
-        onNewChallenge(
-          roomCode,
-          hostUid,
-          hostName,
-          hostFlag,
-          category,
-          hostPlayerId,
-          targetPlayerId
-        );
-      }
-      return;
-    }
-
-    if (seenRoomCodes.has(roomCode)) return;
-    seenRoomCodes.add(roomCode);
-
-    onNewChallenge(
-      roomCode,
-      hostUid,
-      hostName,
-      hostFlag,
-      category,
-      hostPlayerId,
-      targetPlayerId
-    );
-  };
-
-  return onSnapshot(
-    q,
-    snap => {
-      if (isInitialSnapshot) {
-        isInitialSnapshot = false;
-        snap.docs.forEach(d => {
-          processRoomDoc(d.id, d.data(), true);
-        });
+    const processRoomDoc = (
+      docId: string,
+      data: Record<string, any>,
+      isFromInitial: boolean
+    ) => {
+      const roomCode = String(data.roomCode || docId);
+      const rawTarget = String(data.targetPlayerId || '');
+      if (rawTarget === '__online_matchmaking__' || roomCode.startsWith('mm_')) {
+        seenRoomCodes.add(roomCode);
         return;
       }
 
-      snap.docChanges().forEach(change => {
-        if (change.type === 'added' || change.type === 'modified') {
-          const data = change.doc.data();
-          if (data.status === 'waiting') {
-            processRoomDoc(change.doc.id, data, false);
-          }
+      const hostUid = String(data.hostUid || '');
+      const hostName = String(data.hostName || 'منافس جديد');
+      const hostFlag = String(data.hostFlag || '🇸🇦');
+      const hostPlayerId = String(data.hostPlayerId || '');
+      const targetPlayerId = normalizePlayerIdTag(rawTarget);
+      const category = String(data.category || 'cocktail');
+
+      // Never notify the host about their own room
+      if (
+        hostUid === mySafeUid ||
+        (hostPlayerId && normalizePlayerIdTag(hostPlayerId) === myNormalizedId) ||
+        hostName.toLowerCase() === (myAccount.username || '').toLowerCase()
+      ) {
+        seenRoomCodes.add(roomCode);
+        return;
+      }
+
+      // If this room targets a specific player ID, ONLY notify that exact target player
+      if (targetPlayerId && targetPlayerId !== myNormalizedId) {
+        seenRoomCodes.add(roomCode);
+        return;
+      }
+
+      // On initial snapshot, only trigger if this room is specifically targeting this player
+      // and was created within the last 5 minutes so stale old rooms don't pop up
+      if (isFromInitial) {
+        const rawCreated = data.createdAt || data.updatedAt;
+        const createdMs =
+          rawCreated && typeof rawCreated.toMillis === 'function'
+            ? rawCreated.toMillis()
+            : Date.now();
+        const isRecentTargetedInvite =
+          targetPlayerId === myNormalizedId &&
+          Date.now() - createdMs <= 5 * 60 * 1000;
+
+        seenRoomCodes.add(roomCode);
+        if (isRecentTargetedInvite) {
+          onNewChallenge(
+            roomCode,
+            hostUid,
+            hostName,
+            hostFlag,
+            category,
+            hostPlayerId,
+            targetPlayerId
+          );
         }
-      });
-    },
-    error => {
-      handleFirestoreError(error, OperationType.LIST, path);
-    }
+        return;
+      }
+
+      if (seenRoomCodes.has(roomCode)) return;
+      seenRoomCodes.add(roomCode);
+
+      onNewChallenge(
+        roomCode,
+        hostUid,
+        hostName,
+        hostFlag,
+        category,
+        hostPlayerId,
+        targetPlayerId
+      );
+    };
+
+    return onSnapshot(
+      q,
+      snap => {
+        if (isInitialSnapshot) {
+          isInitialSnapshot = false;
+          snap.docs.forEach(d => {
+            processRoomDoc(d.id, d.data(), true);
+          });
+          return;
+        }
+
+        snap.docChanges().forEach(change => {
+          if (change.type === 'added' || change.type === 'modified') {
+            const data = change.doc.data();
+            if (data.status === 'waiting') {
+              processRoomDoc(change.doc.id, data, false);
+            }
+          }
+        });
+      },
+      error => {
+        handleFirestoreError(error, OperationType.LIST, path);
+      }
+    );
+  } catch (err) {
+    handleFirestoreError(err, OperationType.LIST, 'rooms');
+    return () => {};
+  }
+}
+
+// ============================================================================
+// REAL-TIME CLOUD FRIEND REQUESTS (`friend_requests` in Firestore)
+// ============================================================================
+
+export async function sendCloudFriendRequest(
+  fromAccount: PlayerAccount,
+  targetPlayer: {
+    uid?: string;
+    playerId: string;
+    username?: string;
+    countryFlag?: string;
+    rating?: number;
+    vipTier?: VipTier;
+  }
+): Promise<{ ok: boolean; requestId: string }> {
+  const fromPid = normalizePlayerIdTag(fromAccount.playerId || '#1000000000').slice(
+    0,
+    16
   );
+  const toPid = normalizePlayerIdTag(targetPlayer.playerId || '').slice(0, 16);
+  const cleanFromDigits = fromPid.replace(/[^a-zA-Z0-9]/g, '') || '0';
+  const cleanToDigits = toPid.replace(/[^a-zA-Z0-9]/g, '') || '0';
+  const requestId = `freq_${cleanFromDigits}_${cleanToDigits}`.slice(0, 120);
+
+  if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    return { ok: false, requestId };
+  }
+
+  // Ensure sender's profile is synced to Firestore so the recipient can always discover them
+  syncPlayerToCloud(fromAccount).catch(() => {});
+
+  const fromSafeUid = getSafeDocUid(fromAccount);
+  const toSafeUid = (targetPlayer.uid || `plr_${cleanToDigits}`)
+    .replace(/[^a-zA-Z0-9_-]/g, '_')
+    .slice(0, 120);
+
+  const payload = cleanFirestoreData({
+    requestId,
+    fromUid: fromSafeUid,
+    fromPlayerId: fromPid,
+    fromName: (fromAccount.username || 'لاعب_الميدان').trim().slice(0, 32) || 'لاعب',
+    fromFlag: (fromAccount.countryFlag || '🇸🇦').trim().slice(0, 16) || '🇸🇦',
+    fromRating: Math.max(0, Math.floor(Number(fromAccount.rating || 1200))),
+    fromVipTier: (fromAccount.vipTier || 'basic') as VipTier,
+    toPlayerId: toPid,
+    toUid: toSafeUid,
+    toName: (targetPlayer.username || `لاعب ${toPid}`).trim().slice(0, 32),
+    toFlag: (targetPlayer.countryFlag || '🇸🇦').trim().slice(0, 16) || '🇸🇦',
+    toRating: Math.max(0, Math.floor(Number(targetPlayer.rating || 1200))),
+    toVipTier: (targetPlayer.vipTier || 'basic') as VipTier,
+    status: 'pending',
+    timestamp: Math.floor(Date.now()),
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  });
+
+  try {
+    const reqRef = doc(db, 'friend_requests', requestId);
+    const existingSnap = await getDoc(reqRef).catch(() => null);
+    if (!existingSnap || !existingSnap.exists()) {
+      await setDoc(reqRef, payload);
+    } else {
+      await updateDoc(
+        reqRef,
+        cleanFirestoreUpdateData({
+          status: 'pending',
+          timestamp: Math.floor(Date.now()),
+          updatedAt: serverTimestamp(),
+        })
+      );
+    }
+    return { ok: true, requestId };
+  } catch (err) {
+    handleFirestoreError(err, OperationType.WRITE, `friend_requests/${requestId}`);
+    return { ok: false, requestId };
+  }
+}
+
+export async function respondToCloudFriendRequest(
+  requestId: string,
+  acceptorAccount: PlayerAccount,
+  decision: 'accepted' | 'rejected'
+): Promise<boolean> {
+  if (typeof navigator !== 'undefined' && !navigator.onLine) return false;
+  const cleanId = String(requestId || '')
+    .replace(/[^a-zA-Z0-9_-]/g, '_')
+    .slice(0, 120);
+  if (!cleanId) return false;
+
+  // Ensure acceptor's profile is also synced to Firestore
+  syncPlayerToCloud(acceptorAccount).catch(() => {});
+
+  try {
+    const reqRef = doc(db, 'friend_requests', cleanId);
+    await updateDoc(
+      reqRef,
+      cleanFirestoreUpdateData({
+        status: decision,
+        toUid: getSafeDocUid(acceptorAccount),
+        toName: (acceptorAccount.username || 'لاعب').trim().slice(0, 32) || 'لاعب',
+        toFlag: (acceptorAccount.countryFlag || '🇸🇦').trim().slice(0, 16) || '🇸🇦',
+        toRating: Math.max(0, Math.floor(Number(acceptorAccount.rating || 1200))),
+        toVipTier: (acceptorAccount.vipTier || 'basic') as VipTier,
+        timestamp: Math.floor(Date.now()),
+        updatedAt: serverTimestamp(),
+      })
+    );
+    return true;
+  } catch (err) {
+    handleFirestoreError(err, OperationType.UPDATE, `friend_requests/${cleanId}`);
+    return false;
+  }
+}
+
+/**
+ * Real-time listener (`onSnapshot`) on `friend_requests` in Firestore:
+ * 1) Watches incoming `pending` requests where `toPlayerId === myAccount.playerId`
+ *    and triggers `onIncomingPending(pendingList, newestRequest)` so a live pop-up banner
+ *    appears immediately on Player B's screen ("لديك طلب صداقة جديد من [الاسم] - قبول / رفض").
+ * 2) Watches `accepted` requests where either `fromPlayerId === myAccount.playerId` OR
+ *    `toPlayerId === myAccount.playerId` and triggers `onMutualFriendAccepted(friendItem)`
+ *    so BOTH players are automatically added to each other's friends list in real time!
+ */
+export function subscribeToCloudFriendRequests(
+  myAccount: PlayerAccount,
+  callbacks: {
+    onIncomingPending: (
+      pendingRequests: CloudFriendRequestItem[],
+      newestRequest: CloudFriendRequestItem | null
+    ) => void;
+    onMutualFriendAccepted: (newFriend: FriendItem) => void;
+  }
+): Unsubscribe {
+  if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    return () => {};
+  }
+
+  try {
+    const myNormalizedId = normalizePlayerIdTag(myAccount.playerId || '');
+    if (!myNormalizedId) return () => {};
+
+    const seenPendingIds = new Set<string>();
+    const processedAcceptedIds = new Set<string>();
+
+    const q = query(
+      collection(db, 'friend_requests'),
+      where('status', 'in', ['pending', 'accepted'])
+    );
+
+    return onSnapshot(
+      q,
+      snap => {
+        const incomingPending: CloudFriendRequestItem[] = [];
+        let newestPending: CloudFriendRequestItem | null = null;
+
+        snap.docs.forEach(d => {
+          const data = d.data();
+          const reqId = String(data.requestId || d.id);
+          const fromPlayerId = normalizePlayerIdTag(String(data.fromPlayerId || ''));
+          const toPlayerId = normalizePlayerIdTag(String(data.toPlayerId || ''));
+          const status = String(data.status || 'pending') as
+            | 'pending'
+            | 'accepted'
+            | 'rejected';
+
+          if (status === 'pending' && toPlayerId === myNormalizedId && fromPlayerId !== myNormalizedId) {
+            const item: CloudFriendRequestItem = {
+              requestId: reqId,
+              fromUid: String(data.fromUid || `plr_${fromPlayerId.replace(/[^0-9]/g, '')}`),
+              fromPlayerId,
+              fromName: String(data.fromName || 'لاعب جديد'),
+              fromFlag: String(data.fromFlag || '🇸🇦'),
+              fromRating: Number(data.fromRating || 1200),
+              fromVipTier: (data.fromVipTier || 'basic') as VipTier,
+              toPlayerId,
+              toUid: String(data.toUid || ''),
+              toName: String(data.toName || ''),
+              toFlag: String(data.toFlag || '🇸🇦'),
+              toRating: Number(data.toRating || 1200),
+              toVipTier: (data.toVipTier || 'basic') as VipTier,
+              status: 'pending',
+              timestamp: Number(data.timestamp || Date.now()),
+            };
+            incomingPending.push(item);
+
+            if (!seenPendingIds.has(reqId)) {
+              seenPendingIds.add(reqId);
+              newestPending = item;
+            }
+          } else if (status === 'accepted') {
+            if (fromPlayerId === myNormalizedId && toPlayerId && toPlayerId !== myNormalizedId) {
+              // I sent this friend request and Player B just accepted it!
+              const acceptKey = `${reqId}_from_${toPlayerId}`;
+              if (!processedAcceptedIds.has(acceptKey)) {
+                processedAcceptedIds.add(acceptKey);
+                callbacks.onMutualFriendAccepted({
+                  uid: String(
+                    data.toUid || `plr_${toPlayerId.replace(/[^0-9]/g, '')}`
+                  ),
+                  playerId: toPlayerId,
+                  username: String(data.toName || `صديق ${toPlayerId}`),
+                  countryFlag: String(data.toFlag || '🇸🇦'),
+                  rating: Number(data.toRating || 1200),
+                  vipTier: (data.toVipTier || 'basic') as VipTier,
+                  addedAt: Number(data.timestamp || Date.now()),
+                  isFavorite: true,
+                  presenceStatus: 'online',
+                });
+              }
+            } else if (toPlayerId === myNormalizedId && fromPlayerId && fromPlayerId !== myNormalizedId) {
+              // I accepted Player A's friend request! Ensure Player A is in my friends list too
+              const acceptKey = `${reqId}_to_${fromPlayerId}`;
+              if (!processedAcceptedIds.has(acceptKey)) {
+                processedAcceptedIds.add(acceptKey);
+                callbacks.onMutualFriendAccepted({
+                  uid: String(
+                    data.fromUid || `plr_${fromPlayerId.replace(/[^0-9]/g, '')}`
+                  ),
+                  playerId: fromPlayerId,
+                  username: String(data.fromName || `صديق ${fromPlayerId}`),
+                  countryFlag: String(data.fromFlag || '🇸🇦'),
+                  rating: Number(data.fromRating || 1200),
+                  vipTier: (data.fromVipTier || 'basic') as VipTier,
+                  addedAt: Number(data.timestamp || Date.now()),
+                  isFavorite: true,
+                  presenceStatus: 'online',
+                });
+              }
+            }
+          }
+        });
+
+        incomingPending.sort((a, b) => b.timestamp - a.timestamp);
+        callbacks.onIncomingPending(incomingPending, newestPending);
+      },
+      err => {
+        handleFirestoreError(err, OperationType.LIST, 'friend_requests');
+      }
+    );
+  } catch (err) {
+    handleFirestoreError(err, OperationType.LIST, 'friend_requests');
+    return () => {};
+  }
 }
 
 export interface FriendRealtimePresence {
